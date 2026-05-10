@@ -10,13 +10,27 @@ extern "C" {
 #endif
 
 /*
- * vm_stowaway: a library for reading and writing memory of a target macOS
- * process via a dylib that runs inside it.
+ * vm_stowaway: a tiny library for reading and writing memory of a target
+ * macOS process via a dylib that runs inside it.
  *
- * Spawn the target with vm_stowaway_launch(), which sets DYLD_INSERT_LIBRARIES
- * to point at the payload dylib. The payload listens on a Unix socket; the
- * controller (the side that links this header) talks to it via the functions
- * below.
+ * Two ways to get the payload into the target:
+ *
+ *   1. vm_stowaway_launch(): spawn the target with DYLD_INSERT_LIBRARIES set.
+ *      Simplest. Works on binaries WITHOUT hardened runtime + library
+ *      validation (your own builds, unsigned tools, CTF targets, apps you
+ *      have re-signed without those flags).
+ *
+ *   2. vm_stowaway_patch(): rewrite the target's Mach-O to add an
+ *      LC_LOAD_DYLIB entry pointing at the payload, then ad-hoc re-sign.
+ *      Works on hardened-runtime apps you can modify on disk. The patched
+ *      binary loads the payload every time it's started, until you revert.
+ *
+ * After either, the payload listens on a Unix socket and the controller
+ * speaks to it through this API.
+ *
+ * Use this for apps you have the right to modify: your own software, open
+ * source apps, CTF targets, mod-friendly games. Don't use it to break ToS
+ * on online services.
  */
 
 typedef struct vm_stowaway vm_stowaway_t;
@@ -39,6 +53,24 @@ typedef struct {
 } vm_stowaway_launch_opts_t;
 
 typedef struct {
+    /* Output path. NULL -> patch in place. */
+    const char *out_path;
+
+    /* If true, emit LC_LOAD_WEAK_DYLIB so a missing payload doesn't abort
+     * the host. Useful when shipping a patched binary that should still run
+     * without the payload installed. */
+    int weak;
+
+    /* If true (default), shell out to `codesign --force --sign -` after
+     * patching. Set to 0 if you'll sign separately. */
+    int resign;
+
+    /* If true, also strip an existing LC_CODE_SIGNATURE load command before
+     * resigning. Set to 0 to leave it alone (codesign will overwrite). */
+    int strip_existing_sig;
+} vm_stowaway_patch_opts_t;
+
+typedef struct {
     uint64_t base;
     uint64_t slide;
     char     path[1024];
@@ -59,8 +91,8 @@ vm_stowaway_t *vm_stowaway_launch(const char *path,
                                   const vm_stowaway_launch_opts_t *opts,
                                   char *errbuf, size_t errlen);
 
-/* Connect to an already-running process that hosts the payload (i.e. was
- * launched with DYLD_INSERT_LIBRARIES outside of this library). */
+/* Connect to a process whose binary was patched with vm_stowaway_patch and
+ * which is already running. `pid` must be that process's pid. */
 vm_stowaway_t *vm_stowaway_attach(pid_t pid,
                                   const char *socket_path,
                                   int connect_timeout_s,
@@ -70,6 +102,15 @@ void vm_stowaway_close(vm_stowaway_t *h);
 
 /* Underlying pid of the target. */
 pid_t vm_stowaway_pid(const vm_stowaway_t *h);
+
+/* -- patcher (Mach-O LC_LOAD_DYLIB rewriting) --------------------------- */
+
+/* Add an LC_LOAD_DYLIB to `binary` pointing at `payload_install_name`.
+ * Returns 0 on success, -1 on error. */
+int vm_stowaway_patch(const char *binary,
+                      const char *payload_install_name,
+                      const vm_stowaway_patch_opts_t *opts,
+                      char *errbuf, size_t errlen);
 
 /* -- memory operations -------------------------------------------------- */
 
