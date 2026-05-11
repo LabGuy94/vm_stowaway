@@ -24,36 +24,33 @@ jobs:
       - name: smoke test
         run: make test
 
-      - name: compute tag
-        id: tag
+      - name: package
+        id: pkg
         run: |
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            TAG="$GITHUB_REF_NAME"
-            PRE=false
+            TAG="$GITHUB_REF_NAME"; VERSIONED=1
           elif [[ -n "${{ github.event.inputs.tag }}" ]]; then
-            TAG="${{ github.event.inputs.tag }}"
-            PRE=false
+            TAG="${{ github.event.inputs.tag }}"; VERSIONED=1
           else
-            TAG="v0.1.0-$(git rev-parse --short HEAD)"
-            PRE=true
+            TAG="latest"; VERSIONED=0
           fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
-
-      - name: package
-        run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          OUT="vm_stowaway-${TAG}-macos-universal"
-          mkdir -p "$OUT/bin" "$OUT/lib" "$OUT/include"
-          cp build/vm_stowaway "$OUT/bin/"
-          cp build/libvm_stowaway.a "$OUT/lib/"
-          cp build/libvm_stowaway.dylib "$OUT/lib/"
-          cp build/libvm_stowaway_payload.dylib "$OUT/lib/"
-          cp build/libvm_stowaway_machshim.dylib "$OUT/lib/"
-          cp include/vm_stowaway.h "$OUT/include/"
-          cp LICENSE README.md "$OUT/"
-          tar czf "$OUT.tar.gz" "$OUT"
-          shasum -a 256 "$OUT.tar.gz" > "$OUT.tar.gz.sha256"
+          STAGE="vm_stowaway-macos-universal"
+          mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/include"
+          cp build/vm_stowaway                       "$STAGE/bin/"
+          cp build/libvm_stowaway.a                  "$STAGE/lib/"
+          cp build/libvm_stowaway.dylib              "$STAGE/lib/"
+          cp build/libvm_stowaway_payload.dylib      "$STAGE/lib/"
+          cp build/libvm_stowaway_machshim.dylib     "$STAGE/lib/"
+          cp include/vm_stowaway.h                   "$STAGE/include/"
+          cp LICENSE README.md                       "$STAGE/"
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          if [[ "$VERSIONED" == 1 ]]; then
+            cp "$STAGE.tar.gz"        "vm_stowaway-${TAG}-macos-universal.tar.gz"
+            cp "$STAGE.tar.gz.sha256" "vm_stowaway-${TAG}-macos-universal.tar.gz.sha256"
+          fi
+          echo "tag=$TAG"             >> "$GITHUB_OUTPUT"
+          echo "versioned=$VERSIONED" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -62,12 +59,29 @@ jobs:
             vm_stowaway-*.tar.gz
             vm_stowaway-*.tar.gz.sha256
 
-      - name: release
+      # branch pushes: rolling "latest" release with a stable-named tarball, so
+      # /releases/latest/download/vm_stowaway-macos-universal.tar.gz keeps working
+      - name: release (rolling latest)
+        if: steps.pkg.outputs.versioned == '0'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          prerelease: ${{ steps.tag.outputs.prerelease }}
+          tag_name: latest
+          name: latest
+          prerelease: false
+          make_latest: true
+          target_commitish: ${{ github.sha }}
+          files: |
+            vm_stowaway-macos-universal.tar.gz
+            vm_stowaway-macos-universal.tar.gz.sha256
+
+      # tagged releases: stable name + versioned name, latest gets bumped
+      - name: release (versioned)
+        if: steps.pkg.outputs.versioned == '1'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pkg.outputs.tag }}
+          generate_release_notes: true
+          make_latest: true
           files: |
             vm_stowaway-*.tar.gz
             vm_stowaway-*.tar.gz.sha256
-          generate_release_notes: true

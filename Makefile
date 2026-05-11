@@ -32,6 +32,7 @@ CLI_BIN     := $(BUILD)/$(NAME)
 
 EXAMPLES := $(BUILD)/examples/target \
             $(BUILD)/examples/controller_example \
+            $(BUILD)/examples/attach_example \
             $(BUILD)/examples/mach_client
 
 .PHONY: all clean install test
@@ -80,6 +81,11 @@ $(BUILD)/examples/target: examples/target.c
 	codesign --force --sign - $@
 
 $(BUILD)/examples/controller_example: examples/controller_example.c $(LIB_STATIC)
+	@mkdir -p $(dir $@)
+	$(CC) $(EXAMPLE_CFLAGS) $(LDFLAGS) $< $(LIB_STATIC) -o $@
+	codesign --force --sign - $@
+
+$(BUILD)/examples/attach_example: examples/attach_example.c $(LIB_STATIC)
 	@mkdir -p $(dir $@)
 	$(CC) $(EXAMPLE_CFLAGS) $(LDFLAGS) $< $(LIB_STATIC) -o $@
 	codesign --force --sign - $@
