@@ -212,27 +212,75 @@ int vm_stowaway_find_app_bundle(const char *path, char *out, size_t outlen) {
     }
 }
 
-int vm_stowaway_unharden(const char *src_app, const char *dst_app,
+/* Common path for unharden and grant_task_allow. If `entitlements_plist` is
+ * non-NULL, it's passed as `--entitlements` to the resigner. If dst_app is
+ * NULL or equal to src_app, re-sign in place (no copy). */
+static int resign_bundle(const char *src_app, const char *dst_app,
+                         const char *entitlements_plist,
                          char *errbuf, size_t errlen) {
-    char *rm_argv[]    = { "rm", "-rf", (char *)dst_app, NULL };
-    if (run_silent("rm", rm_argv) != 0) {
-        scan_seterr(errbuf, errlen, "rm -rf %s failed", dst_app);
-        return -1;
+    const char *target = dst_app && dst_app[0] ? dst_app : src_app;
+    int in_place = (target == src_app) || strcmp(target, src_app) == 0;
+    if (!in_place) {
+        char *rm_argv[] = { "rm", "-rf", (char *)target, NULL };
+        if (run_silent("rm", rm_argv) != 0) {
+            scan_seterr(errbuf, errlen, "rm -rf %s failed", target);
+            return -1;
+        }
+        char *cp_argv[] = { "cp", "-R", (char *)src_app, (char *)target, NULL };
+        if (run_silent("cp", cp_argv) != 0) {
+            scan_seterr(errbuf, errlen, "cp -R %s %s failed", src_app, target);
+            return -1;
+        }
     }
-    char *cp_argv[]    = { "cp", "-R", (char *)src_app, (char *)dst_app, NULL };
-    if (run_silent("cp", cp_argv) != 0) {
-        scan_seterr(errbuf, errlen, "cp -R %s %s failed", src_app, dst_app);
-        return -1;
-    }
-    char *xattr_argv[] = { "xattr", "-cr", (char *)dst_app, NULL };
+    char *xattr_argv[] = { "xattr", "-cr", (char *)target, NULL };
     run_silent("xattr", xattr_argv);
-    char *cs_rm_argv[] = { "codesign", "--remove-signature", (char *)dst_app, NULL };
+    char *cs_rm_argv[] = { "codesign", "--remove-signature", (char *)target, NULL };
     run_silent("codesign", cs_rm_argv);
-    char *cs_re_argv[] = { "codesign", "--force", "--deep", "--sign", "-",
-                           (char *)dst_app, NULL };
-    if (run_silent("codesign", cs_re_argv) != 0) {
-        scan_seterr(errbuf, errlen, "codesign --force --deep --sign - %s failed", dst_app);
+    char *re_with_ent[] = {
+        "codesign", "--force", "--deep", "--sign", "-",
+        "--entitlements", (char *)entitlements_plist,
+        (char *)target, NULL,
+    };
+    char *re_without_ent[] = {
+        "codesign", "--force", "--deep", "--sign", "-",
+        (char *)target, NULL,
+    };
+    char *const *argv = entitlements_plist ? re_with_ent : re_without_ent;
+    if (run_silent("codesign", argv) != 0) {
+        scan_seterr(errbuf, errlen, "codesign --force --deep --sign - %s failed", target);
         return -1;
     }
     return 0;
+}
+
+int vm_stowaway_unharden(const char *src_app, const char *dst_app,
+                         char *errbuf, size_t errlen) {
+    return resign_bundle(src_app, dst_app, NULL, errbuf, errlen);
+}
+
+int vm_stowaway_grant_task_allow(const char *src_app, const char *dst_app,
+                                 char *errbuf, size_t errlen) {
+    char tmpl[] = "/tmp/vmsw-ent.XXXXXX.plist";
+    int fd = mkstemps(tmpl, 6);
+    if (fd < 0) {
+        scan_seterr(errbuf, errlen, "mkstemps: %s", strerror(errno));
+        return -1;
+    }
+    const char *plist =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+        "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        "<plist version=\"1.0\"><dict>\n"
+        "  <key>com.apple.security.get-task-allow</key><true/>\n"
+        "</dict></plist>\n";
+    size_t n = strlen(plist);
+    if ((size_t)write(fd, plist, n) != n) {
+        close(fd); unlink(tmpl);
+        scan_seterr(errbuf, errlen, "write entitlements: %s", strerror(errno));
+        return -1;
+    }
+    close(fd);
+    int rc = resign_bundle(src_app, dst_app, tmpl, errbuf, errlen);
+    unlink(tmpl);
+    return rc;
 }

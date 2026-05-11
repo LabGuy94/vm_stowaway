@@ -40,6 +40,7 @@ __all__ = [
     "patch", "unpatch",
     "scan_hijacks", "hijack_drop",
     "scan_apps", "scan_electron", "find_app_bundle", "unharden",
+    "grant_task_allow", "amfi_bypass", "disable_libval",
 ]
 
 
@@ -219,6 +220,17 @@ _vm_stowaway_find_app_bundle = _bind("vm_stowaway_find_app_bundle", c_int,
     [c_char_p, c_char_p, c_size_t])
 _vm_stowaway_unharden      = _bind("vm_stowaway_unharden", c_int,
     [c_char_p, c_char_p, c_char_p, c_size_t])
+_vm_stowaway_grant_task_allow = _bind("vm_stowaway_grant_task_allow", c_int,
+    [c_char_p, c_char_p, c_char_p, c_size_t])
+
+_vm_stowaway_amfi_bypass_set = _bind("vm_stowaway_amfi_bypass_set", c_int,
+    [c_int, c_char_p, c_size_t])
+_vm_stowaway_amfi_bypass_get = _bind("vm_stowaway_amfi_bypass_get", c_int,
+    [c_char_p, c_size_t])
+_vm_stowaway_libval_disable_set = _bind("vm_stowaway_libval_disable_set", c_int,
+    [c_int, c_char_p, c_size_t])
+_vm_stowaway_libval_disable_get = _bind("vm_stowaway_libval_disable_get", c_int,
+    [c_char_p, c_size_t])
 
 
 # python-side types ------------------------------------------------------
@@ -638,6 +650,52 @@ def unharden(src_app: str, dst_app: str) -> None:
     if _vm_stowaway_unharden(src_app.encode(), dst_app.encode(),
                               err, len(err)) < 0:
         raise VMStowawayError(f"unharden({src_app!r}): {err.value.decode(errors='replace')}")
+
+
+def grant_task_allow(src_app: str, dst_app: Optional[str] = None) -> None:
+    """Re-sign a bundle with com.apple.security.get-task-allow. If dst_app is
+    None, re-sign in place; otherwise copy src->dst then re-sign."""
+    err = ctypes.create_string_buffer(256)
+    if _vm_stowaway_grant_task_allow(
+            src_app.encode(),
+            dst_app.encode() if dst_app else None,
+            err, len(err)) < 0:
+        raise VMStowawayError(
+            f"grant_task_allow({src_app!r}): {err.value.decode(errors='replace')}")
+
+
+class _Toggle:
+    """on/off/status toggle exposed by amfi_bypass and disable_libval."""
+
+    __slots__ = ("_get", "_set", "_label")
+
+    def __init__(self, get, set_, label):
+        self._get = get
+        self._set = set_
+        self._label = label
+
+    def status(self) -> bool:
+        err = ctypes.create_string_buffer(256)
+        s = self._get(err, len(err))
+        if s < 0:
+            raise VMStowawayError(f"{self._label} status: {err.value.decode(errors='replace')}")
+        return bool(s)
+
+    def on(self) -> None:
+        err = ctypes.create_string_buffer(256)
+        if self._set(1, err, len(err)) < 0:
+            raise VMStowawayError(f"{self._label} on: {err.value.decode(errors='replace')}")
+
+    def off(self) -> None:
+        err = ctypes.create_string_buffer(256)
+        if self._set(0, err, len(err)) < 0:
+            raise VMStowawayError(f"{self._label} off: {err.value.decode(errors='replace')}")
+
+
+amfi_bypass = _Toggle(
+    _vm_stowaway_amfi_bypass_get, _vm_stowaway_amfi_bypass_set, "amfi-bypass")
+disable_libval = _Toggle(
+    _vm_stowaway_libval_disable_get, _vm_stowaway_libval_disable_set, "disable-libval")
 
 
 # internal: re-call into the library to grow when the first array was too small

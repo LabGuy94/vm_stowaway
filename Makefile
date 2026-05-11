@@ -19,7 +19,7 @@ LDFLAGS    += $(ARCHFLAGS) -mmacosx-version-min=11.0
 $(BUILD)/payload/%.o: CFLAGS += -fvisibility=hidden
 $(BUILD)/shim/%.o:    CFLAGS += -fvisibility=hidden
 
-CONTROLLER_SRC := src/controller.c src/patcher.c src/scanner.c
+CONTROLLER_SRC := src/controller.c src/patcher.c src/scanner.c src/sysconfig.c
 PAYLOAD_SRC    := payload/payload.c
 CLI_SRC        := cli/vm_stowaway.c
 SHIM_SRC       := shim/machshim.c

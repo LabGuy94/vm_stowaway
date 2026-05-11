@@ -975,6 +975,65 @@ static int cmd_unharden(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_grant_task_allow(int argc, char **argv) {
+    if (argc < 1)
+        die("usage: vm_stowaway grant-task-allow <src.app> [dst.app]\n"
+            "       (re-sign with get-task-allow so any same-uid process can task_for_pid)\n"
+            "       (no dst -> re-sign in place)");
+    const char *src = argv[0];
+    const char *dst = argc >= 2 ? argv[1] : NULL;
+    char err[256] = {0};
+    if (vm_stowaway_grant_task_allow(src, dst, err, sizeof(err)) < 0)
+        die("grant-task-allow: %s", err);
+    ok("%s carries get-task-allow", dst ? dst : src);
+    return 0;
+}
+
+static int cmd_amfi_bypass(int argc, char **argv) {
+    if (argc < 1)
+        die("usage: vm_stowaway amfi-bypass on|off|status\n"
+            "       (sets amfi_get_out_of_my_way=1 boot-arg; reboot required;\n"
+            "        needs root + SIP off, on Apple Silicon also Reduced Security)");
+    char err[256] = {0};
+    if (!strcmp(argv[0], "status")) {
+        int s = vm_stowaway_amfi_bypass_get(err, sizeof(err));
+        if (s < 0) die("amfi-bypass status: %s", err);
+        info("amfi_get_out_of_my_way is %s in current NVRAM boot-args",
+             s ? "SET" : "not set");
+        return 0;
+    }
+    int enable;
+    if      (!strcmp(argv[0], "on"))  enable = 1;
+    else if (!strcmp(argv[0], "off")) enable = 0;
+    else die("expected on|off|status, got: %s", argv[0]);
+    if (vm_stowaway_amfi_bypass_set(enable, err, sizeof(err)) < 0)
+        die("amfi-bypass %s: %s", argv[0], err);
+    ok("boot-args updated; reboot for the change to take effect");
+    return 0;
+}
+
+static int cmd_disable_libval(int argc, char **argv) {
+    if (argc < 1)
+        die("usage: vm_stowaway disable-libval on|off|status\n"
+            "       (toggles DisableLibraryValidation in /Library/Preferences;\n"
+            "        needs root + SIP off; no reboot required)");
+    char err[256] = {0};
+    if (!strcmp(argv[0], "status")) {
+        int s = vm_stowaway_libval_disable_get(err, sizeof(err));
+        if (s < 0) die("disable-libval status: %s", err);
+        info("DisableLibraryValidation is %s", s ? "SET" : "not set");
+        return 0;
+    }
+    int disable;
+    if      (!strcmp(argv[0], "on"))  disable = 1;
+    else if (!strcmp(argv[0], "off")) disable = 0;
+    else die("expected on|off|status, got: %s", argv[0]);
+    if (vm_stowaway_libval_disable_set(disable, err, sizeof(err)) < 0)
+        die("disable-libval %s: %s", argv[0], err);
+    ok("DisableLibraryValidation %s", disable ? "set" : "cleared");
+    return 0;
+}
+
 static int cmd_unpatch(int argc, char **argv) {
     if (argc < 2)
         die("usage: vm_stowaway unpatch <bin> <name-substr> [--out PATH] [--no-sign]");
@@ -1011,6 +1070,17 @@ static void usage(void) {
         "  unharden <src.app> <dst.app>\n"
         "            copy the bundle and ad-hoc resign without hardened runtime/library validation\n"
         "            (afterwards plain `launch` works against it)\n"
+        "  grant-task-allow <src.app> [dst.app]\n"
+        "            re-sign with get-task-allow so any same-uid process can task_for_pid\n"
+        "            it (no root needed afterwards). Omit dst to re-sign in place.\n"
+        "  amfi-bypass on|off|status\n"
+        "            toggle amfi_get_out_of_my_way=1 boot-arg; reboot required.\n"
+        "            With this on, DYLD_INSERT_LIBRARIES is no longer stripped from any\n"
+        "            hardened binary system-wide. Needs root + SIP off.\n"
+        "  disable-libval on|off|status\n"
+        "            toggle /Library/Preferences/.../DisableLibraryValidation. Lets dylibs\n"
+        "            signed by a different team-id load into hardened binaries.\n"
+        "            Needs root + SIP off. No reboot required.\n"
         "  scan-hijacks <bin>\n"
         "            list paths where dropping a dylib would be loaded as a missing dep\n"
         "  hijack  <bin> [--pick N] [--payload PATH] [--dry-run]\n"
@@ -1049,6 +1119,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "patch"))    return cmd_patch(sub_argc, sub_argv);
     if (!strcmp(cmd, "unpatch"))  return cmd_unpatch(sub_argc, sub_argv);
     if (!strcmp(cmd, "unharden")) return cmd_unharden(sub_argc, sub_argv);
+    if (!strcmp(cmd, "grant-task-allow")) return cmd_grant_task_allow(sub_argc, sub_argv);
+    if (!strcmp(cmd, "amfi-bypass"))    return cmd_amfi_bypass(sub_argc, sub_argv);
+    if (!strcmp(cmd, "disable-libval")) return cmd_disable_libval(sub_argc, sub_argv);
     if (!strcmp(cmd, "scan-hijacks")) return cmd_scan_hijacks(sub_argc, sub_argv);
     if (!strcmp(cmd, "scan-targets")) return cmd_scan_targets(sub_argc, sub_argv);
     if (!strcmp(cmd, "scan-electron")) return cmd_scan_electron(sub_argc, sub_argv);

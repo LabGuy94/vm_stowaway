@@ -86,7 +86,8 @@ the full surface is in [`include/vm_stowaway.h`](include/vm_stowaway.h):
 - task/threads: `_dyld_info`, `_threads`, `_thread_get_state`/`_set_state`, `_allocate`/`_deallocate`
 - code: `_call`, `_break_set`/`_wait`/`_clear`/`_cont`
 - patcher: `_patch`/`_unpatch`, `_scan_hijacks`/`_hijack_drop`
-- bundle scanners: `_scan_apps` (hardened + permissive), `_scan_electron`, `_find_app_bundle`, `_unharden`
+- bundle scanners: `_scan_apps` (hardened + permissive), `_scan_electron`, `_find_app_bundle`, `_unharden`, `_grant_task_allow`
+- system toggles: `_amfi_bypass_set`/`_get`, `_libval_disable_set`/`_get`
 
 examples in [`examples/controller_example.c`](examples/controller_example.c) (launch + read/write) and [`examples/attach_example.c`](examples/attach_example.c) (attach + call).
 
@@ -175,6 +176,15 @@ vm_stowaway hijack /Applications/Some.app/Contents/MacOS/Some --pick 0
 
 # copy a hardened-runtime .app and ad-hoc resign it without hardened runtime
 vm_stowaway unharden /Applications/Some.app /tmp/Some-open.app
+
+# re-sign a bundle with com.apple.security.get-task-allow, so any same-uid
+# process can task_for_pid the running target without root
+vm_stowaway grant-task-allow /tmp/Some-open.app             # in place
+vm_stowaway grant-task-allow /Applications/Some.app /tmp/X  # copy first
+
+# system-wide toggles (need root + SIP off; AMFI flip also needs a reboot)
+vm_stowaway amfi-bypass    on|off|status   # amfi_get_out_of_my_way=1 boot-arg
+vm_stowaway disable-libval on|off|status   # /Library/Preferences/...libraryvalidation
 
 # DYLD_INTERPOSE shim — see "shim" above
 vm_stowaway wrap --pid 1234 -- /Applications/BitSlicer.app/Contents/MacOS/BitSlicer

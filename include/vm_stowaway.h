@@ -166,6 +166,40 @@ int vm_stowaway_find_app_bundle(const char *path, char *out, size_t outlen);
 int vm_stowaway_unharden(const char *src_app, const char *dst_app,
                          char *errbuf, size_t errlen);
 
+/* Like `unharden` but also embeds the `com.apple.security.get-task-allow`
+ * entitlement in the resigned bundle, so any same-uid process can
+ * `task_for_pid` the running target without root. If `src_app` == `dst_app`
+ * (or `dst_app` is NULL), the bundle is re-signed in place; otherwise it's
+ * copied first. */
+int vm_stowaway_grant_task_allow(const char *src_app, const char *dst_app,
+                                 char *errbuf, size_t errlen);
+
+/* System-wide AMFI bypass via the `amfi_get_out_of_my_way=1` boot-arg.
+ *
+ * With the boot-arg set (after reboot), AMFI returns "allow everything" from
+ * `amfi_check_dyld_policy_self`, so dyld no longer strips DYLD_INSERT_LIBRARIES
+ * from hardened-runtime binaries. Requires SIP off and root to modify NVRAM;
+ * on Apple Silicon also requires Reduced Security policy. Reboot is required
+ * for any change to take effect.
+ *
+ * _set(enable):  1 -> add the token to boot-args (preserving others)
+ *                0 -> remove the token, leave other boot-args intact
+ * _get():        returns 1 if set in current NVRAM, 0 if not, -1 on error
+ *                (which usually means `nvram` is unavailable).
+ */
+int vm_stowaway_amfi_bypass_set(int enable, char *errbuf, size_t errlen);
+int vm_stowaway_amfi_bypass_get(char *errbuf, size_t errlen);
+
+/* System-wide library-validation override via /Library/Preferences/
+ * com.apple.security.libraryvalidation.plist. Lets dylibs signed by a
+ * different team-id load into hardened-runtime binaries. Requires SIP off
+ * and root (the prefs file is SIP-protected). Pairs naturally with the
+ * LC_LOAD_DYLIB rewrite path. No reboot needed; applies on next exec.
+ *
+ * _get returns 1 if disabled, 0 if not, -1 on error. */
+int vm_stowaway_libval_disable_set(int disable, char *errbuf, size_t errlen);
+int vm_stowaway_libval_disable_get(char *errbuf, size_t errlen);
+
 /* memory ops. */
 
 /* Read up to `len` bytes from `addr` into `buf`. Returns bytes read, or -1

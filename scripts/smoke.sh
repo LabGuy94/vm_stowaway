@@ -132,4 +132,20 @@ otool -L "$PATCHED3" 2>/dev/null | grep -q libvm_stowaway_payload \
     && fail "unpatch: LC_LOAD_DYLIB still present"
 echo "    unpatch ok"
 
+echo "== grant-task-allow"
+GTA_SRC=$(mktemp -t vmsw-gta.XXXXXX)
+cp "$TARGET" "$GTA_SRC"
+chmod +x "$GTA_SRC"
+GTA_DST="${GTA_SRC}.gta"
+"$BUILD/vm_stowaway" grant-task-allow "$GTA_SRC" "$GTA_DST" 2>&1 | sed 's/^/    /' \
+    || fail "grant-task-allow"
+codesign -d --entitlements - "$GTA_DST" 2>&1 | grep -q "get-task-allow" \
+    || fail "grant-task-allow: entitlement missing"
+echo "    get-task-allow entitlement present"
+rm -f "$GTA_SRC" "$GTA_DST"
+
+echo "== sysconfig (status-only; flips need root + SIP off)"
+"$BUILD/vm_stowaway" amfi-bypass    status 2>&1 | sed 's/^/    /' || fail "amfi-bypass status"
+"$BUILD/vm_stowaway" disable-libval status 2>&1 | sed 's/^/    /' || fail "disable-libval status"
+
 echo "ok"
