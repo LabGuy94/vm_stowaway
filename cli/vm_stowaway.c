@@ -22,12 +22,16 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <libgen.h>
+#include <spawn.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ;
 
 #define C_RESET "\033[0m"
 #define C_BOLD  "\033[1m"
@@ -336,31 +340,120 @@ static int default_shim_path(char *out, size_t outlen) {
     return access(out, R_OK) == 0 ? 0 : -1;
 }
 
+/* Run an external command via posix_spawnp. Returns 0 on success. */
+static int run(const char *prog, char *const argv[]) {
+    pid_t pid;
+    int rc = posix_spawnp(&pid, prog, NULL, NULL, argv, environ);
+    if (rc != 0) return rc;
+    int st = 0;
+    waitpid(pid, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+/* Walk up from a path until we find a parent directory whose name ends in
+ * ".app". Returns 0 and writes the bundle path into `out` (without trailing
+ * slash), or -1 if no .app ancestor was found. */
+static int find_app_bundle(const char *path, char *out, size_t outlen) {
+    char buf[2048];
+    snprintf(buf, sizeof(buf), "%s", path);
+    while (1) {
+        char *slash = strrchr(buf, '/');
+        if (!slash) return -1;
+        *slash = 0;
+        size_t n = strlen(buf);
+        if (n >= 4 && strcmp(buf + n - 4, ".app") == 0) {
+            snprintf(out, outlen, "%s", buf);
+            return 0;
+        }
+    }
+}
+
+/* Copy `src_app` to `dst_app`, clear xattrs, strip the existing signature,
+ * re-sign ad-hoc without hardened runtime. Returns 0 on success. */
+static int copy_and_unharden(const char *src_app, const char *dst_app,
+                             char *errbuf, size_t errlen) {
+    /* rm -rf dst (in case it exists from a prior run) */
+    char *rm_argv[] = { "rm", "-rf", (char *)dst_app, NULL };
+    if (run("rm", rm_argv) != 0)
+        { snprintf(errbuf, errlen, "rm -rf %s failed", dst_app); return -1; }
+
+    /* cp -R src dst */
+    char *cp_argv[] = { "cp", "-R", (char *)src_app, (char *)dst_app, NULL };
+    if (run("cp", cp_argv) != 0)
+        { snprintf(errbuf, errlen, "cp -R failed"); return -1; }
+
+    /* xattr -cr dst (clear quarantine + other extended attrs) */
+    char *xattr_argv[] = { "xattr", "-cr", (char *)dst_app, NULL };
+    run("xattr", xattr_argv);  /* ignore failure */
+
+    /* codesign --remove-signature dst (may fail if no sig; that's ok) */
+    char *cs_rm_argv[] = { "codesign", "--remove-signature", (char *)dst_app, NULL };
+    run("codesign", cs_rm_argv);
+
+    /* codesign --force --deep --sign - dst (no --options flag; ad-hoc with
+     * --deep gives every nested framework the same empty team id, which
+     * library validation accepts since they match). */
+    char *cs_re_argv[] = { "codesign", "--force", "--deep", "--sign", "-",
+                           (char *)dst_app, NULL };
+    if (run("codesign", cs_re_argv) != 0)
+        { snprintf(errbuf, errlen, "codesign re-sign failed"); return -1; }
+
+    return 0;
+}
+
 static int cmd_wrap(int argc, char **argv) {
     pid_t target_pid = 0;
     const char *sock = NULL;
+    const char *copy_dest = NULL;
     char shim[1024] = {0};
     int i = 0;
     for (; i < argc; i++) {
         if (!strcmp(argv[i], "--pid") && i + 1 < argc) target_pid = (pid_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--sock") && i + 1 < argc) sock = argv[++i];
         else if (!strcmp(argv[i], "--shim") && i + 1 < argc) snprintf(shim, sizeof(shim), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--copy") && i + 1 < argc) copy_dest = argv[++i];
         else if (!strcmp(argv[i], "--")) { i++; break; }
         else break;
     }
     if (target_pid <= 0 || i >= argc)
-        die("usage: vm_stowaway wrap --pid PID [--sock PATH] [--shim PATH] -- <tool> [args...]");
+        die("usage: vm_stowaway wrap --pid PID [--sock PATH] [--shim PATH] [--copy DEST.app] -- <tool> [args...]");
 
     if (!shim[0] && default_shim_path(shim, sizeof(shim)) < 0)
         die("can't find libvm_stowaway_machshim.dylib; pass --shim PATH");
+
+    /* If --copy is set: find the .app bundle the tool lives inside, copy it
+     * to the destination, ad-hoc resign without hardened runtime, then exec
+     * the equivalent path inside the copy. This is the one-shot fix for
+     * "App Management blocked codesign on the original" and for hardened
+     * runtime stripping DYLD_INSERT_LIBRARIES at load time. */
+    char exec_path[2048];
+    snprintf(exec_path, sizeof(exec_path), "%s", argv[i]);
+
+    if (copy_dest) {
+        char src_app[2048];
+        if (find_app_bundle(argv[i], src_app, sizeof(src_app)) < 0)
+            die("--copy: %s isn't inside a .app bundle", argv[i]);
+
+        info("copying %s -> %s and re-signing without hardened runtime",
+             src_app, copy_dest);
+        char err[256] = {0};
+        if (copy_and_unharden(src_app, copy_dest, err, sizeof(err)) < 0)
+            die("copy/sign: %s", err);
+
+        /* Re-base the exec path inside the copy. */
+        size_t slen = strlen(src_app);
+        if (strncmp(argv[i], src_app, slen) != 0)
+            die("internal: tool path doesn't start with bundle path");
+        snprintf(exec_path, sizeof(exec_path), "%s%s",
+                 copy_dest, argv[i] + slen);
+        ok("ready: %s", exec_path);
+    }
 
     char pid_str[32];
     snprintf(pid_str, sizeof(pid_str), "%d", target_pid);
     setenv("VM_STOWAWAY_TARGET_PID", pid_str, 1);
     if (sock) setenv("VM_STOWAWAY_SOCK", sock, 1);
 
-    /* Append our shim to DYLD_INSERT_LIBRARIES rather than clobbering, in
-     * case the user is already injecting something. */
     const char *existing = getenv("DYLD_INSERT_LIBRARIES");
     if (existing && *existing) {
         size_t n = strlen(existing) + 1 + strlen(shim) + 1;
@@ -372,9 +465,10 @@ static int cmd_wrap(int argc, char **argv) {
         setenv("DYLD_INSERT_LIBRARIES", shim, 1);
     }
 
-    info("wrap pid=%d shim=%s -> exec %s", target_pid, shim, argv[i]);
-    execvp(argv[i], &argv[i]);
-    die("exec %s: %s", argv[i], strerror(errno));
+    info("wrap pid=%d shim=%s -> exec %s", target_pid, shim, exec_path);
+    argv[i] = exec_path;
+    execvp(exec_path, &argv[i]);
+    die("exec %s: %s", exec_path, strerror(errno));
 }
 
 static int cmd_attach(int argc, char **argv) {
