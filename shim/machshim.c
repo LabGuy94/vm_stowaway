@@ -250,6 +250,95 @@ static kern_return_t vmsw_mach_port_mod_refs(ipc_space_t task,
     return mach_port_mod_refs(task, name, right, delta);
 }
 
+/* --- task control APIs (no-op for our sentinel) --- */
+
+static kern_return_t vmsw_task_suspend(task_t task) {
+    if (task == VMSW_SENTINEL_PORT) {
+        log_msg("task_suspend(sentinel) -> ok (no-op)");
+        return KERN_SUCCESS;
+    }
+    return task_suspend(task);
+}
+
+static kern_return_t vmsw_task_resume(task_t task) {
+    if (task == VMSW_SENTINEL_PORT) {
+        log_msg("task_resume(sentinel) -> ok (no-op)");
+        return KERN_SUCCESS;
+    }
+    return task_resume(task);
+}
+
+/* task_info: zero-fill the requested struct and return success. Tools use
+ * a variety of flavors (TASK_BASIC_INFO_64 for cpu/mem, TASK_DYLD_INFO for
+ * the dyld_all_image_infos pointer, ...). Returning all-zeros is enough to
+ * get past tools that only check kern_return; tools that depend on the
+ * specific fields will need a richer impl (planned). */
+static kern_return_t vmsw_task_info(task_name_t task,
+                                    task_flavor_t flavor,
+                                    task_info_t info,
+                                    mach_msg_type_number_t *count) {
+    if (task == VMSW_SENTINEL_PORT) {
+        log_msg("task_info(sentinel, flavor=%u, count=%u) -> zero-filled",
+                flavor, count ? *count : 0);
+        if (info && count && *count > 0)
+            memset(info, 0, (size_t)(*count) * sizeof(integer_t));
+        return KERN_SUCCESS;
+    }
+    return task_info(task, flavor, info, count);
+}
+
+static kern_return_t vmsw_task_threads(task_inspect_t task,
+                                       thread_act_array_t *threads,
+                                       mach_msg_type_number_t *count) {
+    if (task == VMSW_SENTINEL_PORT) {
+        log_msg("task_threads(sentinel) -> empty list");
+        if (threads) *threads = NULL;
+        if (count) *count = 0;
+        return KERN_SUCCESS;
+    }
+    return task_threads(task, threads, count);
+}
+
+/* --- VM allocation / protection (sentinel path) --- */
+
+static kern_return_t vmsw_mach_vm_allocate(vm_map_t task,
+                                           mach_vm_address_t *addr,
+                                           mach_vm_size_t size,
+                                           int flags) {
+    if (task == VMSW_SENTINEL_PORT) {
+        log_msg("mach_vm_allocate(sentinel, size=%llu) -> KERN_FAILURE "
+                "(allocation in target not supported by v1 shim)", size);
+        return KERN_FAILURE;
+    }
+    return mach_vm_allocate(task, addr, size, flags);
+}
+
+static kern_return_t vmsw_mach_vm_deallocate(vm_map_t task,
+                                             mach_vm_address_t addr,
+                                             mach_vm_size_t size) {
+    if (task == VMSW_SENTINEL_PORT) {
+        log_msg("mach_vm_deallocate(sentinel) -> ok (no-op)");
+        return KERN_SUCCESS;
+    }
+    return mach_vm_deallocate(task, addr, size);
+}
+
+static kern_return_t vmsw_mach_vm_protect(vm_map_t task,
+                                          mach_vm_address_t addr,
+                                          mach_vm_size_t size,
+                                          boolean_t set_max,
+                                          vm_prot_t new_prot) {
+    if (task == VMSW_SENTINEL_PORT) {
+        /* Page perm changes inside the target are best-effort: the payload
+         * already toggles RW for writes via mach_vm_protect in the target.
+         * Pretend success for the tool. */
+        log_msg("mach_vm_protect(sentinel, addr=0x%llx size=%llu prot=%d) "
+                "-> ok (no-op)", addr, size, new_prot);
+        return KERN_SUCCESS;
+    }
+    return mach_vm_protect(task, addr, size, set_max, new_prot);
+}
+
 /* -- DYLD_INTERPOSE table ------------------------------------------------- */
 
 #define DYLD_INTERPOSE(_replacement, _replacee) \
@@ -270,3 +359,10 @@ DYLD_INTERPOSE(vmsw_mach_vm_region,          mach_vm_region);
 DYLD_INTERPOSE(vmsw_mach_vm_region_recurse,  mach_vm_region_recurse);
 DYLD_INTERPOSE(vmsw_mach_port_deallocate,    mach_port_deallocate);
 DYLD_INTERPOSE(vmsw_mach_port_mod_refs,      mach_port_mod_refs);
+DYLD_INTERPOSE(vmsw_task_suspend,            task_suspend);
+DYLD_INTERPOSE(vmsw_task_resume,             task_resume);
+DYLD_INTERPOSE(vmsw_task_info,               task_info);
+DYLD_INTERPOSE(vmsw_task_threads,            task_threads);
+DYLD_INTERPOSE(vmsw_mach_vm_allocate,        mach_vm_allocate);
+DYLD_INTERPOSE(vmsw_mach_vm_deallocate,      mach_vm_deallocate);
+DYLD_INTERPOSE(vmsw_mach_vm_protect,         mach_vm_protect);
