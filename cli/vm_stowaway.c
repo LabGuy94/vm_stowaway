@@ -66,6 +66,101 @@ static int parse_hex(const char *s, uint8_t **out, size_t *out_len) {
     return 0;
 }
 
+/* Connect helpers. A "target" is either a numeric pid or a process name. */
+static vm_stowaway_t *attach_pid(pid_t pid, const char *sock);
+
+static vm_stowaway_t *attach_target(const char *target, const char *sock) {
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(target, &end, 10);
+    if (!errno && end != target && *end == 0) return attach_pid((pid_t)v, sock);
+    pid_t pid = vm_stowaway_find_pid(target);
+    if (pid <= 0) {
+        fprintf(stderr, "err: no process named %s\n", target);
+        exit(1);
+    }
+    return attach_pid(pid, sock);
+}
+
+/* Parse an address spec: "0x..." / decimal, or "ImageSubstr+0xN" / "Image+N".
+ * For image-relative parses, queries `h` for images to resolve the base. */
+static int parse_addr(vm_stowaway_t *h, const char *s, uint64_t *out) {
+    const char *plus = strchr(s, '+');
+    if (!plus) return parse_u64(s, out);
+
+    size_t namelen = (size_t)(plus - s);
+    char name[256];
+    if (namelen >= sizeof(name)) return -1;
+    memcpy(name, s, namelen);
+    name[namelen] = 0;
+
+    uint64_t off;
+    if (parse_u64(plus + 1, &off) < 0) return -1;
+
+    vm_stowaway_image_t buf[1024];
+    ssize_t n = vm_stowaway_images(h, buf, 1024);
+    if (n < 0) return -1;
+    if (n > 1024) n = 1024;
+    for (ssize_t i = 0; i < n; i++) {
+        if (strstr(buf[i].path, name)) { *out = buf[i].base + off; return 0; }
+    }
+    return -1;
+}
+
+/* Cache loaded images for --syms annotation. */
+struct image_cache {
+    vm_stowaway_image_t *v;
+    ssize_t n;
+};
+
+static int load_images(vm_stowaway_t *h, struct image_cache *out) {
+    size_t cap = 1024;
+    vm_stowaway_image_t *buf = malloc(cap * sizeof(*buf));
+    if (!buf) return -1;
+    ssize_t n = vm_stowaway_images(h, buf, cap);
+    if (n > (ssize_t)cap) {
+        cap = (size_t)n;
+        free(buf);
+        buf = malloc(cap * sizeof(*buf));
+        if (!buf) return -1;
+        n = vm_stowaway_images(h, buf, cap);
+    }
+    if (n < 0) { free(buf); return -1; }
+    out->v = buf;
+    out->n = n;
+    return 0;
+}
+
+/* Best-effort: return image whose base <= addr < base+0x10000000.
+ * (We don't know image sizes; cap the lookback to something plausible.) */
+static const vm_stowaway_image_t *image_for(const struct image_cache *ic,
+                                            uint64_t addr) {
+    const vm_stowaway_image_t *best = NULL;
+    uint64_t best_off = UINT64_MAX;
+    for (ssize_t i = 0; i < ic->n; i++) {
+        if (addr < ic->v[i].base) continue;
+        uint64_t off = addr - ic->v[i].base;
+        if (off < best_off && off < 0x10000000ull) {
+            best = &ic->v[i];
+            best_off = off;
+        }
+    }
+    return best;
+}
+
+static void json_string(const char *s) {
+    putchar('"');
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '"' || *p == '\\') { putchar('\\'); putchar(*p); }
+        else if (*p == '\n') fputs("\\n", stdout);
+        else if (*p == '\r') fputs("\\r", stdout);
+        else if (*p == '\t') fputs("\\t", stdout);
+        else if (*p < 0x20)  printf("\\u%04x", *p);
+        else putchar(*p);
+    }
+    putchar('"');
+}
+
 static void print_hex(const uint8_t *buf, size_t len, uint64_t base) {
     for (size_t i = 0; i < len; i += 16) {
         printf("%016llx  ", (unsigned long long)(base + i));
@@ -80,6 +175,22 @@ static void print_hex(const uint8_t *buf, size_t len, uint64_t base) {
             putchar((b >= 32 && b < 127) ? b : '.');
         }
         printf("|\n");
+    }
+}
+
+/* Hex dump with pointer-sized words annotated when they point inside an image. */
+static void print_hex_syms(const uint8_t *buf, size_t len, uint64_t base,
+                           const struct image_cache *ic) {
+    print_hex(buf, len, base);
+    for (size_t i = 0; i + 8 <= len; i += 8) {
+        uint64_t w;
+        memcpy(&w, buf + i, sizeof(w));
+        const vm_stowaway_image_t *im = image_for(ic, w);
+        if (!im) continue;
+        const char *bname = strrchr(im->path, '/');
+        bname = bname ? bname + 1 : im->path;
+        printf("  +%04zx -> %s+0x%llx\n", i, bname,
+               (unsigned long long)(w - im->base));
     }
 }
 
@@ -112,30 +223,40 @@ static vm_stowaway_t *attach_pid(pid_t pid, const char *sock) {
 }
 
 static int cmd_read(int argc, char **argv) {
-    if (argc < 3) die("usage: vm_stowaway read <pid> <addr> <len>");
-    pid_t pid = (pid_t)atoi(argv[0]);
+    if (argc < 3) die("usage: vm_stowaway read <target> <addr> <len> [--syms]");
+    int want_syms = 0;
+    for (int i = 3; i < argc; i++) {
+        if (!strcmp(argv[i], "--syms")) want_syms = 1;
+        else die("unknown flag: %s", argv[i]);
+    }
+    vm_stowaway_t *h = attach_target(argv[0], NULL);
     uint64_t addr, len;
-    if (parse_u64(argv[1], &addr) < 0) die("bad addr");
+    if (parse_addr(h, argv[1], &addr) < 0) die("bad addr");
     if (parse_u64(argv[2], &len) < 0) die("bad len");
-    vm_stowaway_t *h = attach_pid(pid, NULL);
     uint8_t *buf = malloc((size_t)len);
     if (!buf) die("oom");
     ssize_t got = vm_stowaway_read(h, addr, buf, (size_t)len);
     if (got < 0) die("read: %s", vm_stowaway_last_error(h));
-    print_hex(buf, (size_t)got, addr);
+    if (want_syms) {
+        struct image_cache ic = {0};
+        if (load_images(h, &ic) < 0) die("images: %s", vm_stowaway_last_error(h));
+        print_hex_syms(buf, (size_t)got, addr, &ic);
+        free(ic.v);
+    } else {
+        print_hex(buf, (size_t)got, addr);
+    }
     free(buf);
     vm_stowaway_close(h);
     return 0;
 }
 
 static int cmd_write(int argc, char **argv) {
-    if (argc < 3) die("usage: vm_stowaway write <pid> <addr> <hex>");
-    pid_t pid = (pid_t)atoi(argv[0]);
+    if (argc < 3) die("usage: vm_stowaway write <target> <addr> <hex>");
+    vm_stowaway_t *h = attach_target(argv[0], NULL);
     uint64_t addr;
-    if (parse_u64(argv[1], &addr) < 0) die("bad addr");
+    if (parse_addr(h, argv[1], &addr) < 0) die("bad addr");
     uint8_t *bytes; size_t blen;
     if (parse_hex(argv[2], &bytes, &blen) < 0) die("bad hex bytes");
-    vm_stowaway_t *h = attach_pid(pid, NULL);
     ssize_t w = vm_stowaway_write(h, addr, bytes, blen);
     if (w < 0) die("write: %s", vm_stowaway_last_error(h));
     ok("wrote %zd bytes to 0x%llx", w, (unsigned long long)addr);
@@ -145,9 +266,13 @@ static int cmd_write(int argc, char **argv) {
 }
 
 static int cmd_regions(int argc, char **argv) {
-    if (argc < 1) die("usage: vm_stowaway regions <pid>");
-    pid_t pid = (pid_t)atoi(argv[0]);
-    vm_stowaway_t *h = attach_pid(pid, NULL);
+    if (argc < 1) die("usage: vm_stowaway regions <target> [--json]");
+    int json = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--json")) json = 1;
+        else die("unknown flag: %s", argv[i]);
+    }
+    vm_stowaway_t *h = attach_target(argv[0], NULL);
 
     size_t cap = 4096;
     vm_stowaway_region_t *buf = malloc(cap * sizeof(*buf));
@@ -161,16 +286,28 @@ static int cmd_regions(int argc, char **argv) {
         n = vm_stowaway_regions(h, buf, cap);
     }
     if (n < 0) die("regions: %s", vm_stowaway_last_error(h));
-    for (ssize_t i = 0; i < n; i++) {
-        char p[4] = "---";
-        if (buf[i].prot & 1) p[0] = 'r';
-        if (buf[i].prot & 2) p[1] = 'w';
-        if (buf[i].prot & 4) p[2] = 'x';
-        printf("%016llx-%016llx %s  %llu\n",
-               (unsigned long long)buf[i].base,
-               (unsigned long long)(buf[i].base + buf[i].size),
-               p,
-               (unsigned long long)buf[i].size);
+
+    if (json) {
+        printf("[");
+        for (ssize_t i = 0; i < n; i++) {
+            if (i) putchar(',');
+            printf("{\"base\":\"0x%llx\",\"size\":%llu,\"prot\":%u}",
+                   (unsigned long long)buf[i].base,
+                   (unsigned long long)buf[i].size, buf[i].prot);
+        }
+        printf("]\n");
+    } else {
+        for (ssize_t i = 0; i < n; i++) {
+            char p[4] = "---";
+            if (buf[i].prot & 1) p[0] = 'r';
+            if (buf[i].prot & 2) p[1] = 'w';
+            if (buf[i].prot & 4) p[2] = 'x';
+            printf("%016llx-%016llx %s  %llu\n",
+                   (unsigned long long)buf[i].base,
+                   (unsigned long long)(buf[i].base + buf[i].size),
+                   p,
+                   (unsigned long long)buf[i].size);
+        }
     }
     free(buf);
     vm_stowaway_close(h);
@@ -178,9 +315,13 @@ static int cmd_regions(int argc, char **argv) {
 }
 
 static int cmd_images(int argc, char **argv) {
-    if (argc < 1) die("usage: vm_stowaway images <pid>");
-    pid_t pid = (pid_t)atoi(argv[0]);
-    vm_stowaway_t *h = attach_pid(pid, NULL);
+    if (argc < 1) die("usage: vm_stowaway images <target> [--json]");
+    int json = 0;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--json")) json = 1;
+        else die("unknown flag: %s", argv[i]);
+    }
+    vm_stowaway_t *h = attach_target(argv[0], NULL);
 
     size_t cap = 1024;
     vm_stowaway_image_t *buf = malloc(cap * sizeof(*buf));
@@ -194,22 +335,35 @@ static int cmd_images(int argc, char **argv) {
         n = vm_stowaway_images(h, buf, cap);
     }
     if (n < 0) die("images: %s", vm_stowaway_last_error(h));
-    for (ssize_t i = 0; i < n; i++)
-        printf("%016llx  slide=%016llx  %s\n",
-               (unsigned long long)buf[i].base,
-               (unsigned long long)buf[i].slide,
-               buf[i].path);
+
+    if (json) {
+        printf("[");
+        for (ssize_t i = 0; i < n; i++) {
+            if (i) putchar(',');
+            printf("{\"base\":\"0x%llx\",\"slide\":\"0x%llx\",\"path\":",
+                   (unsigned long long)buf[i].base,
+                   (unsigned long long)buf[i].slide);
+            json_string(buf[i].path);
+            putchar('}');
+        }
+        printf("]\n");
+    } else {
+        for (ssize_t i = 0; i < n; i++)
+            printf("%016llx  slide=%016llx  %s\n",
+                   (unsigned long long)buf[i].base,
+                   (unsigned long long)buf[i].slide,
+                   buf[i].path);
+    }
     free(buf);
     vm_stowaway_close(h);
     return 0;
 }
 
 static int cmd_resolve(int argc, char **argv) {
-    if (argc < 2) die("usage: vm_stowaway resolve <pid> [image] <symbol>");
-    pid_t pid = (pid_t)atoi(argv[0]);
+    if (argc < 2) die("usage: vm_stowaway resolve <target> [image] <symbol>");
     const char *image = argc == 2 ? NULL : argv[1];
     const char *sym = argc == 2 ? argv[1] : argv[2];
-    vm_stowaway_t *h = attach_pid(pid, NULL);
+    vm_stowaway_t *h = attach_target(argv[0], NULL);
     uint64_t addr = vm_stowaway_resolve(h, image, sym);
     if (!addr) die("resolve: %s", vm_stowaway_last_error(h));
     printf("0x%016llx\n", (unsigned long long)addr);
@@ -217,30 +371,302 @@ static int cmd_resolve(int argc, char **argv) {
     return 0;
 }
 
+/* Build a hex pattern (and matching all-0xFF mask) from typed value args. */
+static int value_to_pattern(const char *kind, const char *val,
+                            uint8_t **out, size_t *out_len) {
+    if (!strcmp(kind, "--i32") || !strcmp(kind, "--u32")) {
+        uint64_t v;
+        if (parse_u64(val, &v) < 0) return -1;
+        uint32_t w = (uint32_t)v;
+        *out = malloc(4); if (!*out) return -1;
+        memcpy(*out, &w, 4); *out_len = 4;
+        return 0;
+    }
+    if (!strcmp(kind, "--i64") || !strcmp(kind, "--u64")) {
+        uint64_t v;
+        if (parse_u64(val, &v) < 0) return -1;
+        *out = malloc(8); if (!*out) return -1;
+        memcpy(*out, &v, 8); *out_len = 8;
+        return 0;
+    }
+    if (!strcmp(kind, "--f32")) {
+        float f = strtof(val, NULL);
+        *out = malloc(4); if (!*out) return -1;
+        memcpy(*out, &f, 4); *out_len = 4;
+        return 0;
+    }
+    if (!strcmp(kind, "--f64")) {
+        double f = strtod(val, NULL);
+        *out = malloc(8); if (!*out) return -1;
+        memcpy(*out, &f, 8); *out_len = 8;
+        return 0;
+    }
+    if (!strcmp(kind, "--str")) {
+        size_t n = strlen(val);
+        *out = malloc(n); if (!*out) return -1;
+        memcpy(*out, val, n); *out_len = n;
+        return 0;
+    }
+    return -1;
+}
+
 static int cmd_scan(int argc, char **argv) {
-    if (argc < 4) die("usage: vm_stowaway scan <pid> <start> <end> <hex-pat> [--mask HEX]");
-    pid_t pid = (pid_t)atoi(argv[0]);
+    if (argc < 4)
+        die("usage: vm_stowaway scan <target> <start> <end> <hex-pat | --i32 N | --u32 N | --i64 N | --u64 N | --f32 N | --f64 N | --str S> [--mask HEX] [--json]");
+    vm_stowaway_t *h = attach_target(argv[0], NULL);
     uint64_t start, end;
-    if (parse_u64(argv[1], &start) < 0) die("bad start");
-    if (parse_u64(argv[2], &end) < 0) die("bad end");
-    uint8_t *pat; size_t plen;
-    if (parse_hex(argv[3], &pat, &plen) < 0) die("bad pattern");
-    uint8_t *mask = NULL; size_t mlen = 0;
-    for (int i = 4; i < argc; i++) {
+    if (parse_addr(h, argv[1], &start) < 0) die("bad start");
+    if (parse_addr(h, argv[2], &end) < 0) die("bad end");
+
+    uint8_t *pat = NULL, *mask = NULL;
+    size_t plen = 0, mlen = 0;
+    int json = 0;
+    int i = 3;
+
+    if (argv[i][0] == '-' && argv[i][1] == '-' &&
+        strcmp(argv[i], "--mask") != 0 && strcmp(argv[i], "--json") != 0) {
+        if (i + 1 >= argc) die("missing value after %s", argv[i]);
+        if (value_to_pattern(argv[i], argv[i + 1], &pat, &plen) < 0)
+            die("bad value or kind: %s %s", argv[i], argv[i + 1]);
+        i += 2;
+    } else {
+        if (parse_hex(argv[i], &pat, &plen) < 0) die("bad pattern");
+        i++;
+    }
+    for (; i < argc; i++) {
         if (!strcmp(argv[i], "--mask") && i + 1 < argc) {
             if (parse_hex(argv[++i], &mask, &mlen) < 0) die("bad mask");
             if (mlen != plen) die("mask length must match pattern");
-        } else die("unknown flag: %s", argv[i]);
+        } else if (!strcmp(argv[i], "--json")) json = 1;
+        else die("unknown flag: %s", argv[i]);
     }
-    vm_stowaway_t *h = attach_pid(pid, NULL);
-    uint64_t hits[256];
-    ssize_t n = vm_stowaway_scan(h, start, end, pat, mask, plen, hits, 256);
+
+    uint64_t hits[1024];
+    ssize_t n = vm_stowaway_scan(h, start, end, pat, mask, plen, hits, 1024);
     if (n < 0) die("scan: %s", vm_stowaway_last_error(h));
-    for (ssize_t i = 0; i < n && i < 256; i++)
-        printf("0x%016llx\n", (unsigned long long)hits[i]);
-    info("%zd hit(s)", n);
-    free(pat);
-    free(mask);
+    if (json) {
+        printf("[");
+        for (ssize_t k = 0; k < n && k < 1024; k++) {
+            if (k) putchar(',');
+            printf("\"0x%llx\"", (unsigned long long)hits[k]);
+        }
+        printf("]\n");
+    } else {
+        for (ssize_t k = 0; k < n && k < 1024; k++)
+            printf("0x%016llx\n", (unsigned long long)hits[k]);
+        info("%zd hit(s)", n);
+    }
+    free(pat); free(mask);
+    vm_stowaway_close(h);
+    return 0;
+}
+
+/* snapshot scan: maintain a session file with a list of candidate addresses
+ * and their last-seen values. On each call we re-read each, filter by the
+ * comparator, and rewrite the session. */
+struct snap_entry { uint64_t addr; int64_t last; };
+
+static const char *snap_path(const char *name, char *buf, size_t buflen) {
+    snprintf(buf, buflen, "/tmp/vm_stowaway.snap.%s", name ? name : "default");
+    return buf;
+}
+
+static int cmd_diff(int argc, char **argv) {
+    if (argc < 2)
+        die("usage:\n"
+            "  vm_stowaway diff start <target> <start> <end> <kind> <val>    initial snapshot via scan\n"
+            "  vm_stowaway diff filter <target> <op> [val]                   op = eq|neq|gt|lt|changed|unchanged\n"
+            "  vm_stowaway diff list                                         dump current snapshot\n"
+            "  vm_stowaway diff drop                                         remove snapshot\n"
+            "(use --name N to keep multiple snapshots side by side; default name = 'default')");
+
+    /* extract --name N if present */
+    const char *name = NULL;
+    int sub_argc = 0;
+    char *sub_argv[16];
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--name") && i + 1 < argc) { name = argv[++i]; continue; }
+        if (sub_argc < 16) sub_argv[sub_argc++] = argv[i];
+    }
+    char pb[256]; const char *path = snap_path(name, pb, sizeof(pb));
+
+    const char *mode = sub_argv[0];
+    if (!strcmp(mode, "drop")) {
+        unlink(path);
+        ok("dropped %s", path);
+        return 0;
+    }
+    if (!strcmp(mode, "list")) {
+        FILE *f = fopen(path, "rb");
+        if (!f) die("no snapshot at %s", path);
+        struct snap_entry e;
+        size_t n = 0;
+        while (fread(&e, sizeof(e), 1, f) == 1) {
+            printf("0x%016llx  %lld\n", (unsigned long long)e.addr, (long long)e.last);
+            n++;
+        }
+        fclose(f);
+        info("%zu entries", n);
+        return 0;
+    }
+    if (!strcmp(mode, "start")) {
+        if (sub_argc < 6) die("diff start needs <target> <start> <end> <kind> <val>");
+        vm_stowaway_t *h = attach_target(sub_argv[1], NULL);
+        uint64_t start, end;
+        if (parse_addr(h, sub_argv[2], &start) < 0) die("bad start");
+        if (parse_addr(h, sub_argv[3], &end)   < 0) die("bad end");
+        uint8_t *pat = NULL; size_t plen = 0;
+        if (value_to_pattern(sub_argv[4], sub_argv[5], &pat, &plen) < 0)
+            die("bad value");
+
+        size_t cap = 1024;
+        uint64_t *hits = malloc(cap * sizeof(uint64_t));
+        if (!hits) die("oom");
+        ssize_t n = vm_stowaway_scan(h, start, end, pat, NULL, plen, hits, cap);
+        if (n < 0) die("scan: %s", vm_stowaway_last_error(h));
+        if (n > (ssize_t)cap) n = (ssize_t)cap;
+
+        /* re-read each as i64 to populate `last` (use 4 or 8 bytes depending on
+         * pattern length; here just pack first 8 bytes). */
+        FILE *f = fopen(path, "wb");
+        if (!f) die("open %s: %s", path, strerror(errno));
+        for (ssize_t i = 0; i < n; i++) {
+            uint8_t b[8] = {0};
+            ssize_t got = vm_stowaway_read(h, hits[i], b,
+                                           plen > 8 ? 8 : plen);
+            int64_t v = 0;
+            if (got > 0) memcpy(&v, b, (size_t)got);
+            struct snap_entry e = { hits[i], v };
+            fwrite(&e, sizeof(e), 1, f);
+        }
+        fclose(f);
+        ok("snapshot %s: %zd entries", path, n);
+        free(pat); free(hits);
+        vm_stowaway_close(h);
+        return 0;
+    }
+    if (!strcmp(mode, "filter")) {
+        if (sub_argc < 3) die("diff filter needs <target> <op> [val]");
+        const char *op = sub_argv[2];
+        int64_t val = 0;
+        int has_val = sub_argc > 3;
+        if (has_val) val = (int64_t)strtoll(sub_argv[3], NULL, 0);
+
+        FILE *f = fopen(path, "rb");
+        if (!f) die("no snapshot at %s", path);
+        size_t cap = 0;
+        struct snap_entry *e = NULL, tmp;
+        while (fread(&tmp, sizeof(tmp), 1, f) == 1) {
+            cap++;
+            e = realloc(e, cap * sizeof(*e));
+            if (!e) die("oom");
+            e[cap - 1] = tmp;
+        }
+        fclose(f);
+
+        vm_stowaway_t *h = attach_target(sub_argv[1], NULL);
+        FILE *out = fopen(path, "wb");
+        if (!out) die("rewrite: %s", strerror(errno));
+        size_t kept = 0;
+        for (size_t i = 0; i < cap; i++) {
+            uint8_t b[8] = {0};
+            ssize_t got = vm_stowaway_read(h, e[i].addr, b, 8);
+            if (got <= 0) continue;
+            int64_t cur = 0;
+            memcpy(&cur, b, (size_t)got);
+            int pass = 0;
+            if      (!strcmp(op, "eq"))        pass = has_val && cur == val;
+            else if (!strcmp(op, "neq"))       pass = has_val && cur != val;
+            else if (!strcmp(op, "gt"))        pass = has_val && cur >  val;
+            else if (!strcmp(op, "lt"))        pass = has_val && cur <  val;
+            else if (!strcmp(op, "changed"))   pass = cur != e[i].last;
+            else if (!strcmp(op, "unchanged")) pass = cur == e[i].last;
+            else die("unknown op: %s", op);
+            if (pass) {
+                struct snap_entry ne = { e[i].addr, cur };
+                fwrite(&ne, sizeof(ne), 1, out);
+                kept++;
+                if (kept <= 64)
+                    printf("0x%016llx  %lld -> %lld\n",
+                           (unsigned long long)e[i].addr,
+                           (long long)e[i].last, (long long)cur);
+            }
+        }
+        fclose(out);
+        free(e);
+        info("%zu of %zu kept", kept, cap);
+        vm_stowaway_close(h);
+        return 0;
+    }
+    die("unknown diff mode: %s", mode);
+}
+
+static int cmd_call(int argc, char **argv) {
+    if (argc < 2)
+        die("usage: vm_stowaway call <target> <addr> [arg0..arg5]   (args parsed as 0x... or decimal)");
+    vm_stowaway_t *h = attach_target(argv[0], NULL);
+    uint64_t addr;
+    if (parse_addr(h, argv[1], &addr) < 0) die("bad addr");
+    uint64_t args[6] = {0};
+    uint32_t nargs = 0;
+    for (int i = 2; i < argc && nargs < 6; i++) {
+        if (parse_addr(h, argv[i], &args[nargs]) < 0) die("bad arg %d: %s", i - 1, argv[i]);
+        nargs++;
+    }
+    uint64_t ret = 0;
+    if (vm_stowaway_call(h, addr, args, nargs, &ret) < 0)
+        die("call: %s", vm_stowaway_last_error(h));
+    printf("0x%llx\n", (unsigned long long)ret);
+    vm_stowaway_close(h);
+    return 0;
+}
+
+static int cmd_break(int argc, char **argv) {
+    if (argc < 2)
+        die("usage:\n"
+            "  vm_stowaway break set    <target> <addr>\n"
+            "  vm_stowaway break clear  <target> <id>\n"
+            "  vm_stowaway break wait   <target> [--ms N]\n"
+            "  vm_stowaway break cont   <target> <tid>");
+    const char *mode = argv[0];
+    vm_stowaway_t *h = attach_target(argv[1], NULL);
+
+    if (!strcmp(mode, "set")) {
+        if (argc < 3) die("break set needs <addr>");
+        uint64_t a;
+        if (parse_addr(h, argv[2], &a) < 0) die("bad addr");
+        uint32_t id = 0;
+        if (vm_stowaway_break_set(h, a, &id) < 0)
+            die("break set: %s", vm_stowaway_last_error(h));
+        printf("bp_id %u at 0x%llx\n", id, (unsigned long long)a);
+    } else if (!strcmp(mode, "clear")) {
+        if (argc < 3) die("break clear needs <id>");
+        uint64_t id;
+        if (parse_u64(argv[2], &id) < 0) die("bad id");
+        if (vm_stowaway_break_clear(h, (uint32_t)id) < 0)
+            die("break clear: %s", vm_stowaway_last_error(h));
+        ok("cleared");
+    } else if (!strcmp(mode, "wait")) {
+        int ms = -1;
+        for (int i = 2; i < argc; i++) {
+            if (!strcmp(argv[i], "--ms") && i + 1 < argc) ms = atoi(argv[++i]);
+            else die("unknown flag: %s", argv[i]);
+        }
+        uint32_t id; uint64_t tid, pc;
+        if (vm_stowaway_break_wait(h, ms, &id, &tid, &pc) < 0)
+            die("break wait: %s", vm_stowaway_last_error(h));
+        printf("hit bp_id=%u tid=%llu pc=0x%llx\n",
+               id, (unsigned long long)tid, (unsigned long long)pc);
+    } else if (!strcmp(mode, "cont")) {
+        if (argc < 3) die("break cont needs <tid>");
+        uint64_t tid;
+        if (parse_u64(argv[2], &tid) < 0) die("bad tid");
+        if (vm_stowaway_break_cont(h, tid) < 0)
+            die("break cont: %s", vm_stowaway_last_error(h));
+        ok("resumed");
+    } else {
+        die("unknown break mode: %s", mode);
+    }
     vm_stowaway_close(h);
     return 0;
 }
@@ -303,12 +729,25 @@ static void repl(vm_stowaway_t *h) {
 }
 
 static int cmd_launch(int argc, char **argv) {
-    if (argc < 1) die("usage: vm_stowaway launch <target> [args...]");
+    if (argc < 1)
+        die("usage: vm_stowaway launch [--name N | --sock PATH] <target> [args...]");
+    char sock_buf[256];
     char err[512] = {0};
     vm_stowaway_launch_opts_t opts = {0};
-    vm_stowaway_t *h = vm_stowaway_launch(argv[0], argv, &opts, err, sizeof(err));
+    int i = 0;
+    for (; i < argc; i++) {
+        if (!strcmp(argv[i], "--name") && i + 1 < argc) {
+            snprintf(sock_buf, sizeof(sock_buf), "/tmp/vm_stowaway.%s.sock", argv[++i]);
+            opts.socket_path = sock_buf;
+        } else if (!strcmp(argv[i], "--sock") && i + 1 < argc) {
+            opts.socket_path = argv[++i];
+        } else break;
+    }
+    if (i >= argc) die("launch: missing target");
+    vm_stowaway_t *h = vm_stowaway_launch(argv[i], argv + i, &opts, err, sizeof(err));
     if (!h) die("launch: %s", err);
-    ok("launched pid %d, payload connected", vm_stowaway_pid(h));
+    ok("launched pid %d, payload connected (sock=%s)",
+       vm_stowaway_pid(h), opts.socket_path ? opts.socket_path : "auto");
     repl(h);
     vm_stowaway_close(h);
     return 0;
@@ -465,17 +904,41 @@ static int cmd_wrap(int argc, char **argv) {
 }
 
 static int cmd_attach(int argc, char **argv) {
-    if (argc < 1) die("usage: vm_stowaway attach <pid> [--sock PATH]");
-    pid_t pid = (pid_t)atoi(argv[0]);
+    if (argc < 1)
+        die("usage: vm_stowaway attach <target> [--sock PATH | --name N]");
+    char sock_buf[256];
     const char *sock = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--sock") && i + 1 < argc) sock = argv[++i];
-        else die("unknown flag: %s", argv[i]);
+        else if (!strcmp(argv[i], "--name") && i + 1 < argc) {
+            snprintf(sock_buf, sizeof(sock_buf), "/tmp/vm_stowaway.%s.sock", argv[++i]);
+            sock = sock_buf;
+        } else die("unknown flag: %s", argv[i]);
     }
-    vm_stowaway_t *h = attach_pid(pid, sock);
-    ok("attached to pid %d", pid);
+    vm_stowaway_t *h = attach_target(argv[0], sock);
+    ok("attached to pid %d", (int)vm_stowaway_pid(h));
     repl(h);
     vm_stowaway_close(h);
+    return 0;
+}
+
+static int cmd_unpatch(int argc, char **argv) {
+    if (argc < 2)
+        die("usage: vm_stowaway unpatch <bin> <name-substr> [--out PATH] [--no-sign]");
+    const char *binary = argv[0];
+    const char *substr = argv[1];
+    vm_stowaway_patch_opts_t opts = { .resign = 1 };
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--no-sign")) opts.resign = 0;
+        else if (!strcmp(argv[i], "--out") && i + 1 < argc) opts.out_path = argv[++i];
+        else die("unknown flag: %s", argv[i]);
+    }
+    char err[512] = {0};
+    int n = vm_stowaway_unpatch(binary, substr, &opts, err, sizeof(err));
+    if (n < 0) die("unpatch: %s", err);
+    ok("removed %d LC_LOAD_DYLIB entr%s%s",
+       n, n == 1 ? "y" : "ies",
+       opts.resign ? " and re-signed ad-hoc" : "");
     return 0;
 }
 
@@ -483,18 +946,30 @@ static void usage(void) {
     fputs(
         "usage: vm_stowaway <command> [args...]\n"
         "\n"
-        "  launch  <target> [args...]              spawn target with payload via DYLD_INSERT_LIBRARIES\n"
-        "  patch   <bin> <install-name>            add LC_LOAD_DYLIB to bin so payload loads on its own\n"
-        "            [--weak] [--out PATH] [--no-sign]\n"
+        "target := <pid> | <process-name>     (attach commands resolve a name to the first matching pid)\n"
+        "addr   := 0x... | <decimal> | Image+0xN\n"
+        "\n"
+        "  launch  [--name N | --sock PATH] <target> [args...]\n"
+        "            spawn target with payload via DYLD_INSERT_LIBRARIES\n"
+        "  patch   <bin> <install-name> [--weak] [--out PATH] [--no-sign]\n"
+        "            add LC_LOAD_DYLIB to bin\n"
+        "  unpatch <bin> <name-substr> [--out PATH] [--no-sign]\n"
+        "            strip LC_LOAD_DYLIBs whose name contains substr\n"
         "  wrap    --pid PID [--sock PATH] [--shim PATH] [--copy DEST.app] -- <tool> [args...]\n"
-        "                                          launch <tool> with the mach shim DYLD_INSERTed\n"
-        "  attach  <pid> [--sock PATH]             connect to a process that already has payload\n"
-        "  read    <pid> <addr> <len>\n"
-        "  write   <pid> <addr> <hex>\n"
-        "  regions <pid>\n"
-        "  images  <pid>\n"
-        "  resolve <pid> [image] <symbol>\n"
-        "  scan    <pid> <start> <end> <hex-pat> [--mask HEX]\n",
+        "            launch <tool> with the mach shim DYLD_INSERTed\n"
+        "  attach  <target> [--sock PATH | --name N]\n"
+        "  read    <target> <addr> <len> [--syms]\n"
+        "  write   <target> <addr> <hex>\n"
+        "  regions <target> [--json]\n"
+        "  images  <target> [--json]\n"
+        "  resolve <target> [image] <symbol>\n"
+        "  scan    <target> <start> <end> <hex-pat | --i32 N | --u32 N | --i64 N | --u64 N | --f32 N | --f64 N | --str S>\n"
+        "          [--mask HEX] [--json]\n"
+        "  diff    start  <target> <start> <end> <kind> <val> [--name N]\n"
+        "          filter <target> <eq|neq|gt|lt|changed|unchanged> [val] [--name N]\n"
+        "          list | drop [--name N]\n"
+        "  call    <target> <addr> [arg0..arg5]\n"
+        "  break   set <target> <addr> | clear <target> <id> | wait <target> [--ms N] | cont <target> <tid>\n",
         stdout);
 }
 
@@ -506,6 +981,7 @@ int main(int argc, char **argv) {
 
     if (!strcmp(cmd, "launch"))   return cmd_launch(sub_argc, sub_argv);
     if (!strcmp(cmd, "patch"))    return cmd_patch(sub_argc, sub_argv);
+    if (!strcmp(cmd, "unpatch"))  return cmd_unpatch(sub_argc, sub_argv);
     if (!strcmp(cmd, "wrap"))     return cmd_wrap(sub_argc, sub_argv);
     if (!strcmp(cmd, "attach"))   return cmd_attach(sub_argc, sub_argv);
     if (!strcmp(cmd, "read"))     return cmd_read(sub_argc, sub_argv);
@@ -514,6 +990,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "images"))   return cmd_images(sub_argc, sub_argv);
     if (!strcmp(cmd, "resolve"))  return cmd_resolve(sub_argc, sub_argv);
     if (!strcmp(cmd, "scan"))     return cmd_scan(sub_argc, sub_argv);
+    if (!strcmp(cmd, "diff"))     return cmd_diff(sub_argc, sub_argv);
+    if (!strcmp(cmd, "call"))     return cmd_call(sub_argc, sub_argv);
+    if (!strcmp(cmd, "break"))    return cmd_break(sub_argc, sub_argv);
     if (!strcmp(cmd, "-h") || !strcmp(cmd, "--help")) { usage(); return 0; }
     fprintf(stderr, "unknown command: %s\n", cmd);
     usage();

@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include <mach/exception_types.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach/task_info.h>
@@ -20,6 +21,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/ucred.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -492,6 +494,358 @@ static int op_deallocate(int fd, uint32_t seq,
     return send_response(fd, VMSW_OK, seq, NULL, 0);
 }
 
+static int op_version(int fd, uint32_t seq) {
+    struct vmsw_version_resp r = {
+        .version = VMSW_VERSION,
+        .caps = 0,
+        .pid = (uint64_t)getpid(),
+    };
+    return send_response(fd, VMSW_OK, seq, &r, sizeof(r));
+}
+
+/* Call addr(args...). Up to 6 u64 args, returns u64. Casts to a 6-arg sig and
+ * relies on the macOS ABI passing the first 6/8 ints in registers, so calling
+ * with fewer real params still works as long as the callee ignores extras. */
+typedef uint64_t (*fn6_t)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
+struct call_ctx {
+    uint64_t addr;
+    uint64_t args[VMSW_CALL_MAX_ARGS];
+    uint32_t nargs;
+    uint64_t ret;
+};
+
+static void *call_thread(void *arg) {
+    struct call_ctx *c = arg;
+    fn6_t f = (fn6_t)(uintptr_t)c->addr;
+    uint64_t a[VMSW_CALL_MAX_ARGS] = {0};
+    for (uint32_t i = 0; i < c->nargs && i < VMSW_CALL_MAX_ARGS; i++) a[i] = c->args[i];
+    c->ret = f(a[0], a[1], a[2], a[3], a[4], a[5]);
+    return NULL;
+}
+
+static int op_call(int fd, uint32_t seq, const uint8_t *body, uint64_t body_len) {
+    if (body_len < sizeof(struct vmsw_call_req))
+        return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "short call req");
+    struct vmsw_call_req req;
+    memcpy(&req, body, sizeof(req));
+    if (req.nargs > VMSW_CALL_MAX_ARGS)
+        return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "too many args");
+
+    struct call_ctx ctx = { .addr = req.addr, .nargs = req.nargs };
+    memcpy(ctx.args, req.args, sizeof(ctx.args));
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, call_thread, &ctx) != 0)
+        return send_error(fd, VMSW_ERR_INTERNAL, seq, "pthread_create");
+    pthread_join(t, NULL);
+
+    struct vmsw_call_resp r = { .ret = ctx.ret };
+    return send_response(fd, VMSW_OK, seq, &r, sizeof(r));
+}
+
+/* breakpoints. */
+
+#if defined(__arm64__)
+static const uint8_t BREAK_INSN[] = { 0x00, 0x00, 0x20, 0xd4 };  /* brk #0 */
+#  define BREAK_INSN_LEN 4
+#  define BREAK_EXC_TYPE EXC_BREAKPOINT
+#elif defined(__x86_64__)
+static const uint8_t BREAK_INSN[] = { 0xcc };  /* int3 */
+#  define BREAK_INSN_LEN 1
+#  define BREAK_EXC_TYPE EXC_BREAKPOINT
+#else
+#  error unsupported arch
+#endif
+
+#define MAX_BREAKPOINTS 64
+
+struct bp {
+    int       used;
+    uint32_t  id;
+    uint64_t  addr;
+    uint8_t   orig[8];
+    uint64_t  suspended_tid;   /* nonzero while a thread is suspended at this bp */
+    thread_act_t suspended_th; /* mach port of suspended thread (send right) */
+};
+
+static struct bp        g_bps[MAX_BREAKPOINTS];
+static uint32_t         g_next_bp_id = 1;
+static pthread_mutex_t  g_bp_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* hits queue: filled by exception handler, drained by op_break_wait. */
+struct bp_hit { uint32_t bp_id; uint64_t tid; uint64_t pc; thread_act_t th; };
+#define HIT_QUEUE_CAP 64
+static struct bp_hit    g_hits[HIT_QUEUE_CAP];
+static size_t           g_hits_head = 0, g_hits_tail = 0;
+static pthread_mutex_t  g_hits_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t   g_hits_cv = PTHREAD_COND_INITIALIZER;
+
+static mach_port_t g_exc_port = MACH_PORT_NULL;
+static int         g_exc_inited = 0;
+
+static int write_bytes(uint64_t addr, const void *data, size_t len) {
+    kern_return_t kr = mach_vm_protect(mach_task_self(), addr, len, FALSE,
+                                       VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) return -1;
+    memcpy((void *)(uintptr_t)addr, data, len);
+    mach_vm_protect(mach_task_self(), addr, len, FALSE,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    return 0;
+}
+
+static void *exc_thread(void *unused) {
+    (void)unused;
+    /* Dispatch loop. Use the MIG-generated server from mach_excServer; but to
+     * avoid pulling that in, we hand-decode the minimal exception_raise_state
+     * format. mach_msg + parse + reply. */
+    for (;;) {
+        struct {
+            mach_msg_header_t Head;
+            /* body: NDR + exception + codeCnt + codes... */
+            mach_msg_body_t   msgh_body;
+            mach_msg_port_descriptor_t thread;
+            mach_msg_port_descriptor_t task;
+            NDR_record_t      NDR;
+            exception_type_t  exception;
+            mach_msg_type_number_t codeCnt;
+            int64_t           code[2];
+        } req;
+        memset(&req, 0, sizeof(req));
+        mach_msg_return_t mr = mach_msg(&req.Head, MACH_RCV_MSG, 0, sizeof(req),
+                                        g_exc_port, MACH_MSG_TIMEOUT_NONE,
+                                        MACH_PORT_NULL);
+        if (mr != MACH_MSG_SUCCESS) {
+            log_msg("exc mach_msg: 0x%x", mr);
+            continue;
+        }
+
+        thread_act_t th = req.thread.name;
+        task_t       tk = req.task.name;
+        exception_type_t exc = req.exception;
+        (void)tk;
+        log_msg("exception %d on thread 0x%x", exc, th);
+
+        uint32_t bp_id = 0;
+        uint64_t pc = 0, tid = 0;
+        if (exc == BREAK_EXC_TYPE) {
+#if defined(__arm64__)
+            arm_thread_state64_t s;
+            mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
+            if (thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&s, &n) == KERN_SUCCESS)
+                pc = __darwin_arm_thread_state64_get_pc(s);
+#elif defined(__x86_64__)
+            x86_thread_state64_t s;
+            mach_msg_type_number_t n = x86_THREAD_STATE64_COUNT;
+            if (thread_get_state(th, x86_THREAD_STATE64, (thread_state_t)&s, &n) == KERN_SUCCESS)
+                pc = s.__rip - 1;  /* int3 leaves rip past the trap byte */
+#endif
+            thread_identifier_info_data_t ti;
+            mach_msg_type_number_t tc = THREAD_IDENTIFIER_INFO_COUNT;
+            if (thread_info(th, THREAD_IDENTIFIER_INFO, (thread_info_t)&ti, &tc) == KERN_SUCCESS)
+                tid = ti.thread_id;
+
+            pthread_mutex_lock(&g_bp_mu);
+            for (size_t i = 0; i < MAX_BREAKPOINTS; i++) {
+                if (g_bps[i].used && g_bps[i].addr == pc) { bp_id = g_bps[i].id; break; }
+            }
+            pthread_mutex_unlock(&g_bp_mu);
+        }
+
+        /* Suspend the offending thread. The controller resumes via BREAK_CONT. */
+        thread_suspend(th);
+
+        pthread_mutex_lock(&g_hits_mu);
+        if (g_hits_tail - g_hits_head < HIT_QUEUE_CAP) {
+            g_hits[g_hits_tail++ % HIT_QUEUE_CAP] = (struct bp_hit){ bp_id, tid, pc, th };
+            pthread_cond_signal(&g_hits_cv);
+        } else {
+            /* queue full; drop and let the thread continue */
+            thread_resume(th);
+            mach_port_deallocate(mach_task_self(), th);
+        }
+        pthread_mutex_unlock(&g_hits_mu);
+
+        /* Reply so the kernel doesn't wedge expecting our ack. */
+        struct {
+            mach_msg_header_t Head;
+            NDR_record_t      NDR;
+            kern_return_t     RetCode;
+        } rep = {0};
+        rep.Head.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(req.Head.msgh_bits), 0);
+        rep.Head.msgh_remote_port = req.Head.msgh_remote_port;
+        rep.Head.msgh_local_port = MACH_PORT_NULL;
+        rep.Head.msgh_id = req.Head.msgh_id + 100;
+        rep.Head.msgh_size = sizeof(rep);
+        rep.NDR = NDR_record;
+        rep.RetCode = KERN_SUCCESS;
+        mach_msg(&rep.Head, MACH_SEND_MSG, sizeof(rep), 0,
+                 MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    }
+    return NULL;
+}
+
+static int ensure_exc_thread(void) {
+    if (g_exc_inited) return 0;
+    kern_return_t kr = mach_port_allocate(mach_task_self(),
+                                          MACH_PORT_RIGHT_RECEIVE, &g_exc_port);
+    if (kr != KERN_SUCCESS) return -1;
+    kr = mach_port_insert_right(mach_task_self(), g_exc_port, g_exc_port,
+                                MACH_MSG_TYPE_MAKE_SEND);
+    if (kr != KERN_SUCCESS) return -1;
+    kr = task_set_exception_ports(mach_task_self(),
+                                  EXC_MASK_BREAKPOINT, g_exc_port,
+                                  EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
+                                  THREAD_STATE_NONE);
+    if (kr != KERN_SUCCESS) return -1;
+    pthread_t t;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &a, exc_thread, NULL) != 0) {
+        pthread_attr_destroy(&a);
+        return -1;
+    }
+    pthread_attr_destroy(&a);
+    g_exc_inited = 1;
+    return 0;
+}
+
+static int op_break_set(int fd, uint32_t seq, const uint8_t *body, uint64_t body_len) {
+    if (body_len < sizeof(struct vmsw_break_set_req))
+        return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "short");
+    struct vmsw_break_set_req req;
+    memcpy(&req, body, sizeof(req));
+    if (ensure_exc_thread() < 0)
+        return send_error(fd, VMSW_ERR_INTERNAL, seq, "exception port setup failed");
+
+    pthread_mutex_lock(&g_bp_mu);
+    int slot = -1;
+    for (int i = 0; i < MAX_BREAKPOINTS; i++) if (!g_bps[i].used) { slot = i; break; }
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_bp_mu);
+        return send_error(fd, VMSW_ERR_INTERNAL, seq, "no breakpoint slots");
+    }
+    memcpy(g_bps[slot].orig, (void *)(uintptr_t)req.addr, BREAK_INSN_LEN);
+    if (write_bytes(req.addr, BREAK_INSN, BREAK_INSN_LEN) < 0) {
+        pthread_mutex_unlock(&g_bp_mu);
+        return send_error(fd, VMSW_ERR_BAD_ADDR, seq, "write trap failed");
+    }
+    g_bps[slot].used = 1;
+    g_bps[slot].id   = g_next_bp_id++;
+    g_bps[slot].addr = req.addr;
+    struct vmsw_break_set_resp r = { .bp_id = g_bps[slot].id };
+    pthread_mutex_unlock(&g_bp_mu);
+    return send_response(fd, VMSW_OK, seq, &r, sizeof(r));
+}
+
+static int op_break_clear(int fd, uint32_t seq, const uint8_t *body, uint64_t body_len) {
+    if (body_len < sizeof(struct vmsw_break_clear_req))
+        return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "short");
+    struct vmsw_break_clear_req req;
+    memcpy(&req, body, sizeof(req));
+    pthread_mutex_lock(&g_bp_mu);
+    int found = 0;
+    for (int i = 0; i < MAX_BREAKPOINTS; i++) {
+        if (g_bps[i].used && g_bps[i].id == req.bp_id) {
+            write_bytes(g_bps[i].addr, g_bps[i].orig, BREAK_INSN_LEN);
+            g_bps[i].used = 0;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_bp_mu);
+    if (!found) return send_error(fd, VMSW_ERR_NOT_FOUND, seq, "no such bp");
+    return send_response(fd, VMSW_OK, seq, NULL, 0);
+}
+
+static int op_break_wait(int fd, uint32_t seq, const uint8_t *body, uint64_t body_len) {
+    int32_t timeout_ms = -1;
+    if (body_len >= sizeof(struct vmsw_break_wait_req)) {
+        struct vmsw_break_wait_req req;
+        memcpy(&req, body, sizeof(req));
+        timeout_ms = req.timeout_ms;
+    }
+    pthread_mutex_lock(&g_hits_mu);
+    while (g_hits_head == g_hits_tail) {
+        if (timeout_ms == 0) { pthread_mutex_unlock(&g_hits_mu); return send_error(fd, VMSW_ERR_NOT_FOUND, seq, "no hit"); }
+        if (timeout_ms > 0) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec  += timeout_ms / 1000;
+            ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
+            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+            int rc = pthread_cond_timedwait(&g_hits_cv, &g_hits_mu, &ts);
+            if (rc == ETIMEDOUT) { pthread_mutex_unlock(&g_hits_mu); return send_error(fd, VMSW_ERR_NOT_FOUND, seq, "timeout"); }
+        } else {
+            pthread_cond_wait(&g_hits_cv, &g_hits_mu);
+        }
+    }
+    struct bp_hit hit = g_hits[g_hits_head++ % HIT_QUEUE_CAP];
+    pthread_mutex_unlock(&g_hits_mu);
+
+    /* Remember the suspended thread port so BREAK_CONT can resume it.
+     * Store by tid in the matching bp slot. */
+    pthread_mutex_lock(&g_bp_mu);
+    for (int i = 0; i < MAX_BREAKPOINTS; i++) {
+        if (g_bps[i].used && g_bps[i].id == hit.bp_id) {
+            g_bps[i].suspended_tid = hit.tid;
+            g_bps[i].suspended_th  = hit.th;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_bp_mu);
+
+    struct vmsw_break_wait_resp r = {
+        .bp_id = hit.bp_id, .tid = hit.tid, .pc = hit.pc,
+    };
+    return send_response(fd, VMSW_OK, seq, &r, sizeof(r));
+}
+
+static int op_break_cont(int fd, uint32_t seq, const uint8_t *body, uint64_t body_len) {
+    if (body_len < sizeof(struct vmsw_break_cont_req))
+        return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "short");
+    struct vmsw_break_cont_req req;
+    memcpy(&req, body, sizeof(req));
+
+    thread_act_t th = MACH_PORT_NULL;
+    uint64_t bp_addr = 0;
+    uint8_t  orig[8];
+    int found = 0;
+    pthread_mutex_lock(&g_bp_mu);
+    for (int i = 0; i < MAX_BREAKPOINTS; i++) {
+        if (g_bps[i].used && g_bps[i].suspended_tid == req.tid) {
+            th = g_bps[i].suspended_th;
+            bp_addr = g_bps[i].addr;
+            memcpy(orig, g_bps[i].orig, BREAK_INSN_LEN);
+            g_bps[i].suspended_tid = 0;
+            g_bps[i].suspended_th = MACH_PORT_NULL;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_bp_mu);
+    if (!found) return send_error(fd, VMSW_ERR_NOT_FOUND, seq, "no suspended thread for tid");
+
+    /* Restore the original instruction so the resumed thread doesn't immediately
+     * re-trap. Caller can re-arm via BREAK_SET. */
+    write_bytes(bp_addr, orig, BREAK_INSN_LEN);
+
+#if defined(__x86_64__)
+    /* Back rip up by 1 so we execute the restored byte. */
+    x86_thread_state64_t s;
+    mach_msg_type_number_t n = x86_THREAD_STATE64_COUNT;
+    if (thread_get_state(th, x86_THREAD_STATE64, (thread_state_t)&s, &n) == KERN_SUCCESS) {
+        s.__rip = bp_addr;
+        thread_set_state(th, x86_THREAD_STATE64, (thread_state_t)&s, n);
+    }
+#endif
+
+    thread_resume(th);
+    mach_port_deallocate(mach_task_self(), th);
+    return send_response(fd, VMSW_OK, seq, NULL, 0);
+}
+
 static int serve_one(int cfd) {
     while (1) {
         struct vmsw_hdr h;
@@ -526,6 +880,12 @@ static int serve_one(int cfd) {
         case VMSW_OP_THREAD_SET_STATE: rc = op_thread_set_state(cfd, h.seq, body, h.payload_len); break;
         case VMSW_OP_ALLOCATE:         rc = op_allocate(cfd, h.seq, body, h.payload_len); break;
         case VMSW_OP_DEALLOCATE:       rc = op_deallocate(cfd, h.seq, body, h.payload_len); break;
+        case VMSW_OP_VERSION:          rc = op_version(cfd, h.seq); break;
+        case VMSW_OP_CALL:             rc = op_call(cfd, h.seq, body, h.payload_len); break;
+        case VMSW_OP_BREAK_SET:        rc = op_break_set(cfd, h.seq, body, h.payload_len); break;
+        case VMSW_OP_BREAK_CLEAR:      rc = op_break_clear(cfd, h.seq, body, h.payload_len); break;
+        case VMSW_OP_BREAK_WAIT:       rc = op_break_wait(cfd, h.seq, body, h.payload_len); break;
+        case VMSW_OP_BREAK_CONT:       rc = op_break_cont(cfd, h.seq, body, h.payload_len); break;
         case VMSW_OP_QUIT:             free(body); return 1;
         default:
             rc = send_error(cfd, VMSW_ERR_BAD_OP, h.seq, "unknown op");
@@ -533,6 +893,30 @@ static int serve_one(int cfd) {
         free(body);
         if (rc < 0) return -1;
     }
+}
+
+/* reject connections from peers running as a different uid. */
+static int check_peer(int cfd) {
+    struct xucred cr;
+    socklen_t len = sizeof(cr);
+    if (getsockopt(cfd, 0, LOCAL_PEERCRED, &cr, &len) < 0) return -1;
+    if (cr.cr_version != XUCRED_VERSION) return -1;
+    if (cr.cr_uid != getuid()) return -1;
+    return 0;
+}
+
+static void *client_thread(void *arg) {
+    int cfd = (int)(intptr_t)arg;
+    if (check_peer(cfd) < 0) {
+        log_msg("rejected peer (uid mismatch)");
+        send_error(cfd, VMSW_ERR_AUTH, 0, "peer uid mismatch");
+        close(cfd);
+        return NULL;
+    }
+    log_msg("client connected");
+    serve_one(cfd);
+    close(cfd);
+    return NULL;
 }
 
 static void *server_thread(void *unused) {
@@ -544,13 +928,15 @@ static void *server_thread(void *unused) {
             log_msg("accept failed: %s", strerror(errno));
             return NULL;
         }
-        log_msg("client connected");
-        int r = serve_one(cfd);
-        close(cfd);
-        if (r > 0) {
-            log_msg("quit requested");
-            break;
+        pthread_t t;
+        pthread_attr_t a;
+        pthread_attr_init(&a);
+        pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&t, &a, client_thread, (void *)(intptr_t)cfd) != 0) {
+            log_msg("pthread_create: %s", strerror(errno));
+            close(cfd);
         }
+        pthread_attr_destroy(&a);
     }
     close(g_listen_fd);
     unlink(g_sock_path);
@@ -585,7 +971,7 @@ static void vm_stowaway_init(void) {
     }
     /* Owner-only so other local users can't connect. */
     chmod(g_sock_path, 0600);
-    if (listen(fd, 1) < 0) {
+    if (listen(fd, 8) < 0) {
         log_msg("listen: %s", strerror(errno));
         close(fd);
         return;

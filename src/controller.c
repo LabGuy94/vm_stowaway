@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <libproc.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -27,6 +28,8 @@ struct vm_stowaway {
     int       sock_fd;
     pid_t     pid;
     uint32_t  next_seq;
+    uint32_t  remote_version;
+    uint64_t  remote_pid;
     char      sock_path[256];
     char      last_error[256];
 };
@@ -199,6 +202,32 @@ static int rpc_or_err(vm_stowaway_t *h, uint32_t op,
     return 0;
 }
 
+/* exchange version + pid with the payload. fills h->remote_*. */
+static int do_handshake(vm_stowaway_t *h, char *errbuf, size_t errlen) {
+    uint8_t *body = NULL;
+    size_t body_len = 0;
+    if (rpc_or_err(h, VMSW_OP_VERSION, NULL, 0, &body, &body_len) < 0) {
+        set_errbuf(errbuf, errlen, "version handshake: %s", h->last_error);
+        return -1;
+    }
+    if (body_len < sizeof(struct vmsw_version_resp)) {
+        free(body);
+        set_errbuf(errbuf, errlen, "short version response");
+        return -1;
+    }
+    struct vmsw_version_resp r;
+    memcpy(&r, body, sizeof(r));
+    free(body);
+    if (r.version != VMSW_VERSION) {
+        set_errbuf(errbuf, errlen, "remote payload speaks v%u, we speak v%u",
+                   r.version, VMSW_VERSION);
+        return -1;
+    }
+    h->remote_version = r.version;
+    h->remote_pid     = r.pid;
+    return 0;
+}
+
 vm_stowaway_t *vm_stowaway_launch(const char *path, char *const argv[],
                                   const vm_stowaway_launch_opts_t *opts,
                                   char *errbuf, size_t errlen) {
@@ -270,6 +299,10 @@ vm_stowaway_t *vm_stowaway_launch(const char *path, char *const argv[],
     h->sock_fd = cfd;
     h->pid = child;
     snprintf(h->sock_path, sizeof(h->sock_path), "%s", sock_path);
+    if (do_handshake(h, errbuf, errlen) < 0) {
+        close(cfd); free(h); kill(child, SIGKILL); waitpid(child, NULL, 0);
+        return NULL;
+    }
     return h;
 }
 
@@ -292,6 +325,10 @@ vm_stowaway_t *vm_stowaway_attach(pid_t pid, const char *socket_path,
     h->sock_fd = cfd;
     h->pid = pid;
     snprintf(h->sock_path, sizeof(h->sock_path), "%s", sock);
+    if (do_handshake(h, errbuf, errlen) < 0) {
+        close(cfd); free(h);
+        return NULL;
+    }
     return h;
 }
 
@@ -305,6 +342,28 @@ void vm_stowaway_close(vm_stowaway_t *h) {
 }
 
 pid_t vm_stowaway_pid(const vm_stowaway_t *h) { return h ? h->pid : -1; }
+
+pid_t vm_stowaway_find_pid(const char *name) {
+    if (!name || !*name) return -1;
+    int n = proc_listallpids(NULL, 0);
+    if (n <= 0) return -1;
+    pid_t *pids = calloc((size_t)n, sizeof(pid_t));
+    if (!pids) return -1;
+    int got = proc_listallpids(pids, n * (int)sizeof(pid_t));
+    pid_t self = getpid();
+    pid_t found = -1;
+    for (int i = 0; i < got / (int)sizeof(pid_t); i++) {
+        pid_t p = pids[i];
+        if (p == self || p <= 0) continue;
+        char buf[PROC_PIDPATHINFO_MAXSIZE];
+        if (proc_pidpath(p, buf, sizeof(buf)) <= 0) continue;
+        const char *base = strrchr(buf, '/');
+        base = base ? base + 1 : buf;
+        if (strcmp(base, name) == 0) { found = p; break; }
+    }
+    free(pids);
+    return found;
+}
 const char *vm_stowaway_last_error(const vm_stowaway_t *h) {
     return h ? h->last_error : "no handle";
 }
@@ -521,4 +580,80 @@ ssize_t vm_stowaway_scan(vm_stowaway_t *h,
         memcpy(&out[i], body + i * sizeof(uint64_t), sizeof(uint64_t));
     free(body);
     return (ssize_t)n;
+}
+
+int vm_stowaway_call(vm_stowaway_t *h, uint64_t addr,
+                     const uint64_t *args, uint32_t nargs,
+                     uint64_t *out_ret) {
+    if (nargs > 6) { set_err(h, "too many args"); return -1; }
+    struct vmsw_call_req req = { .addr = addr, .nargs = nargs };
+    for (uint32_t i = 0; i < nargs; i++) req.args[i] = args[i];
+
+    uint8_t *body = NULL; size_t body_len = 0;
+    if (rpc_or_err(h, VMSW_OP_CALL, &req, sizeof(req), &body, &body_len) < 0)
+        return -1;
+    if (body_len < sizeof(struct vmsw_call_resp)) {
+        free(body); set_err(h, "short call response"); return -1;
+    }
+    struct vmsw_call_resp r;
+    memcpy(&r, body, sizeof(r));
+    free(body);
+    if (out_ret) *out_ret = r.ret;
+    return 0;
+}
+
+int vm_stowaway_break_set(vm_stowaway_t *h, uint64_t addr, uint32_t *out_bp_id) {
+    struct vmsw_break_set_req req = { .addr = addr };
+    uint8_t *body = NULL; size_t body_len = 0;
+    if (rpc_or_err(h, VMSW_OP_BREAK_SET, &req, sizeof(req), &body, &body_len) < 0)
+        return -1;
+    if (body_len < sizeof(struct vmsw_break_set_resp)) {
+        free(body); set_err(h, "short break_set response"); return -1;
+    }
+    struct vmsw_break_set_resp r;
+    memcpy(&r, body, sizeof(r));
+    free(body);
+    if (out_bp_id) *out_bp_id = r.bp_id;
+    return 0;
+}
+
+int vm_stowaway_break_clear(vm_stowaway_t *h, uint32_t bp_id) {
+    struct vmsw_break_clear_req req = { .bp_id = bp_id };
+    uint8_t *body = NULL; size_t body_len = 0;
+    int rc = rpc_or_err(h, VMSW_OP_BREAK_CLEAR, &req, sizeof(req), &body, &body_len);
+    free(body);
+    return rc;
+}
+
+int vm_stowaway_break_wait(vm_stowaway_t *h, int timeout_ms,
+                           uint32_t *bp_id, uint64_t *tid, uint64_t *pc) {
+    struct vmsw_break_wait_req req = { .timeout_ms = timeout_ms };
+    uint8_t *body = NULL; size_t body_len = 0;
+    if (rpc_or_err(h, VMSW_OP_BREAK_WAIT, &req, sizeof(req), &body, &body_len) < 0)
+        return -1;
+    if (body_len < sizeof(struct vmsw_break_wait_resp)) {
+        free(body); set_err(h, "short break_wait response"); return -1;
+    }
+    struct vmsw_break_wait_resp r;
+    memcpy(&r, body, sizeof(r));
+    free(body);
+    if (bp_id) *bp_id = r.bp_id;
+    if (tid)   *tid   = r.tid;
+    if (pc)    *pc    = r.pc;
+    return 0;
+}
+
+int vm_stowaway_break_cont(vm_stowaway_t *h, uint64_t tid) {
+    struct vmsw_break_cont_req req = { .tid = tid };
+    uint8_t *body = NULL; size_t body_len = 0;
+    int rc = rpc_or_err(h, VMSW_OP_BREAK_CONT, &req, sizeof(req), &body, &body_len);
+    free(body);
+    return rc;
+}
+
+int vm_stowaway_remote_info(vm_stowaway_t *h, uint32_t *version, uint64_t *pid) {
+    if (!h) return -1;
+    if (version) *version = h->remote_version;
+    if (pid)     *pid     = h->remote_pid;
+    return 0;
 }

@@ -204,6 +204,99 @@ static int patch_slice(uint8_t *data, uint64_t slice_size,
     return 0;
 }
 
+/* Strip every LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB whose name contains
+ * `name_substr`. Zeroes the freed bytes at the tail and updates the header. */
+static int unpatch_slice(uint8_t *data, uint64_t slice_size,
+                         const char *name_substr,
+                         char *err, size_t elen) {
+    if (slice_size < sizeof(struct mach_header_64)) {
+        seterr(err, elen, "slice too small"); return -1;
+    }
+
+    uint32_t magic;
+    memcpy(&magic, data, 4);
+    int swap;
+    if      (magic == MH_MAGIC_64)  swap = 0;
+    else if (magic == MH_CIGAM_64)  swap = 1;
+    else { seterr(err, elen, "32-bit / unknown magic 0x%08x", magic); return -1; }
+
+    struct mach_header_64 hdr;
+    memcpy(&hdr, data, sizeof(hdr));
+    if (swap) {
+        hdr.cputype     = OSSwapInt32(hdr.cputype);
+        hdr.cpusubtype  = OSSwapInt32(hdr.cpusubtype);
+        hdr.filetype    = OSSwapInt32(hdr.filetype);
+        hdr.ncmds       = OSSwapInt32(hdr.ncmds);
+        hdr.sizeofcmds  = OSSwapInt32(hdr.sizeofcmds);
+        hdr.flags       = OSSwapInt32(hdr.flags);
+    }
+
+    uint8_t *lc_cur = data + sizeof(struct mach_header_64);
+    uint8_t *lc_end = lc_cur + hdr.sizeofcmds;
+    if (lc_end > data + slice_size) {
+        seterr(err, elen, "corrupt load commands"); return -1;
+    }
+    uint32_t removed = 0;
+
+    uint32_t i = 0;
+    while (i < hdr.ncmds && lc_cur + sizeof(struct load_command) <= lc_end) {
+        struct load_command lc;
+        memcpy(&lc, lc_cur, sizeof(lc));
+        uint32_t cmd = swap ? OSSwapInt32(lc.cmd) : lc.cmd;
+        uint32_t cmdsize = swap ? OSSwapInt32(lc.cmdsize) : lc.cmdsize;
+        if (cmdsize < sizeof(struct load_command) || lc_cur + cmdsize > lc_end) {
+            seterr(err, elen, "malformed lc at %u", i); return -1;
+        }
+
+        int is_dylib = (cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB);
+        int match = 0;
+        if (is_dylib && cmdsize > sizeof(struct dylib_command)) {
+            struct dylib_command dc;
+            memcpy(&dc, lc_cur, sizeof(dc));
+            uint32_t name_off = swap ? OSSwapInt32(dc.dylib.name.offset)
+                                     : dc.dylib.name.offset;
+            if (name_off < cmdsize) {
+                const char *name = (const char *)(lc_cur + name_off);
+                size_t maxlen = cmdsize - name_off;
+                /* strnstr is BSD; do a manual contains check. */
+                size_t nl = strnlen(name, maxlen);
+                size_t sl = strlen(name_substr);
+                for (size_t k = 0; sl <= nl && k + sl <= nl; k++) {
+                    if (memcmp(name + k, name_substr, sl) == 0) { match = 1; break; }
+                }
+            }
+        }
+
+        if (match) {
+            size_t tail = lc_end - (lc_cur + cmdsize);
+            memmove(lc_cur, lc_cur + cmdsize, tail);
+            memset(lc_end - cmdsize, 0, cmdsize);
+            lc_end -= cmdsize;
+            hdr.ncmds      -= 1;
+            hdr.sizeofcmds -= cmdsize;
+            removed++;
+            /* don't advance lc_cur or i: the next lc has shifted into place. */
+            continue;
+        }
+        lc_cur += cmdsize;
+        i++;
+    }
+
+    if (removed == 0) return 0;  /* nothing to do for this slice; not an error */
+
+    struct mach_header_64 wh = hdr;
+    if (swap) {
+        wh.cputype     = OSSwapInt32(wh.cputype);
+        wh.cpusubtype  = OSSwapInt32(wh.cpusubtype);
+        wh.filetype    = OSSwapInt32(wh.filetype);
+        wh.ncmds       = OSSwapInt32(wh.ncmds);
+        wh.sizeofcmds  = OSSwapInt32(wh.sizeofcmds);
+        wh.flags       = OSSwapInt32(wh.flags);
+    }
+    memcpy(data, &wh, sizeof(wh));
+    return (int)removed;
+}
+
 static int run_codesign(const char *path, char *err, size_t elen) {
     pid_t pid;
     char *const argv[] = { "codesign", "--force", "--sign", "-", (char *)path, NULL };
@@ -305,4 +398,101 @@ out:
         if (run_codesign(target, errbuf, errlen) < 0) return -1;
     }
     return 0;
+}
+
+int vm_stowaway_unpatch(const char *binary, const char *name_substr,
+                        const vm_stowaway_patch_opts_t *opts,
+                        char *errbuf, size_t errlen) {
+    vm_stowaway_patch_opts_t defaults = { .resign = 1 };
+    if (!opts) opts = &defaults;
+    if (!name_substr || !*name_substr) {
+        seterr(errbuf, errlen, "empty name_substr"); return -1;
+    }
+
+    const char *target = binary;
+    if (opts->out_path && strcmp(opts->out_path, binary) != 0) {
+        if (copy_file(binary, opts->out_path, errbuf, errlen) < 0) return -1;
+        target = opts->out_path;
+    }
+
+    int fd = open(target, O_RDWR);
+    if (fd < 0) { seterr(errbuf, errlen, "open(%s): %s", target, strerror(errno)); return -1; }
+    struct stat st;
+    if (fstat(fd, &st) < 0) { seterr(errbuf, errlen, "stat: %s", strerror(errno)); close(fd); return -1; }
+    if (st.st_size < 4) { seterr(errbuf, errlen, "file too small"); close(fd); return -1; }
+
+    uint8_t *data = mmap(NULL, (size_t)st.st_size, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, fd, 0);
+    if (data == MAP_FAILED) {
+        seterr(errbuf, errlen, "mmap: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    uint32_t magic;
+    memcpy(&magic, data, 4);
+
+    int total_removed = 0;
+    int rc = 0;
+    if (magic == FAT_MAGIC || magic == FAT_CIGAM ||
+        magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64) {
+
+        int fat_swap = (magic == FAT_CIGAM || magic == FAT_CIGAM_64);
+        int fat_64 = (magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64);
+        struct fat_header fh;
+        memcpy(&fh, data, sizeof(fh));
+        uint32_t narch = fat_swap ? OSSwapInt32(fh.nfat_arch) : fh.nfat_arch;
+        if (narch == 0 || narch > 32) {
+            seterr(errbuf, errlen, "implausible fat_arch count %u", narch);
+            rc = -1;
+            goto out;
+        }
+        size_t off = sizeof(struct fat_header);
+        for (uint32_t i = 0; i < narch; i++) {
+            uint64_t slice_off = 0, slice_size = 0;
+            if (fat_64) {
+                struct fat_arch_64 fa;
+                memcpy(&fa, data + off, sizeof(fa));
+                slice_off  = fat_swap ? OSSwapInt64(fa.offset) : fa.offset;
+                slice_size = fat_swap ? OSSwapInt64(fa.size)   : fa.size;
+                off += sizeof(struct fat_arch_64);
+            } else {
+                struct fat_arch fa;
+                memcpy(&fa, data + off, sizeof(fa));
+                slice_off  = fat_swap ? OSSwapInt32(fa.offset) : fa.offset;
+                slice_size = fat_swap ? OSSwapInt32(fa.size)   : fa.size;
+                off += sizeof(struct fat_arch);
+            }
+            if (slice_off + slice_size > (uint64_t)st.st_size) {
+                seterr(errbuf, errlen, "fat slice %u out of bounds", i);
+                rc = -1;
+                goto out;
+            }
+            int n = unpatch_slice(data + slice_off, slice_size,
+                                  name_substr, errbuf, errlen);
+            if (n < 0) { rc = -1; goto out; }
+            total_removed += n;
+        }
+    } else {
+        int n = unpatch_slice(data, (uint64_t)st.st_size,
+                              name_substr, errbuf, errlen);
+        if (n < 0) { rc = -1; goto out; }
+        total_removed = n;
+    }
+
+    msync(data, (size_t)st.st_size, MS_SYNC);
+
+out:
+    munmap(data, (size_t)st.st_size);
+    close(fd);
+    if (rc < 0) return -1;
+
+    if (total_removed == 0) {
+        seterr(errbuf, errlen, "no matching LC_LOAD_DYLIB");
+        return -1;
+    }
+    if (opts->resign) {
+        if (run_codesign(target, errbuf, errlen) < 0) return -1;
+    }
+    return total_removed;
 }

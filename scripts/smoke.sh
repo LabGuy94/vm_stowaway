@@ -85,4 +85,51 @@ want "^pid_for_task: "           "no pid_for_task"
 want "^vm_read_overwrite: "      "no legacy vm_read"
 want "^thread_info: ok"          "no thread_info"
 
+echo "== new ops: call, break, diff, unpatch"
+PATCHED3=$(mktemp -t vmsw-newops.XXXXXX)
+cp "$TARGET" "$PATCHED3"
+chmod +x "$PATCHED3"
+"$BUILD/vm_stowaway" patch "$PATCHED3" "$PWD/$BUILD/libvm_stowaway_payload.dylib" \
+    >/dev/null 2>&1
+"$PATCHED3" 30 > "$PATCHED3.out" 2>&1 &
+T3=$!
+disown 2>/dev/null || true
+trap '{ kill $T3 2>/dev/null; wait $T3 2>/dev/null; rm -f "$PATCHED3" "$PATCHED3.out"; } >/dev/null 2>&1' EXIT
+sleep 1
+
+GETPID=$("$BUILD/vm_stowaway" resolve $T3 libsystem_c.dylib getpid 2>/dev/null)
+[[ -n "$GETPID" ]] || fail "resolve getpid"
+RET=$("$BUILD/vm_stowaway" call $T3 $GETPID 2>&1)
+echo "    call getpid -> $RET"
+EXPECTED=$(printf "0x%x" $T3)
+[[ "$RET" == "$EXPECTED" ]] || fail "call: expected $EXPECTED got $RET"
+
+ADDR=$("$BUILD/vm_stowaway" resolve $T3 secret 2>/dev/null)
+BP=$("$BUILD/vm_stowaway" break set $T3 $ADDR 2>&1)
+echo "    $BP"
+echo "$BP" | grep -q "^bp_id [0-9]" || fail "break set"
+BPID=$(echo "$BP" | awk '{print $2}')
+"$BUILD/vm_stowaway" break clear $T3 $BPID >/dev/null || fail "break clear"
+echo "    break set+clear ok"
+
+REGS_OUT=$("$BUILD/vm_stowaway" regions $T3 --json | head -c 80)
+echo "$REGS_OUT" | grep -q '^\[{"base":"0x' || fail "regions --json"
+echo "    regions --json ok"
+
+DIFF_TARGET=$(printf 'Image+0x0' && :)  # we just need an addr; use secret
+"$BUILD/vm_stowaway" diff drop --name smoke >/dev/null 2>&1 || true
+"$BUILD/vm_stowaway" diff start $T3 0x100000000 0x300000000 --i32 42 --name smoke 2>&1 | sed 's/^/    /'
+"$BUILD/vm_stowaway" write $T3 $ADDR "39050000" >/dev/null
+sleep 1
+"$BUILD/vm_stowaway" diff filter $T3 changed --name smoke 2>&1 | tail -3 | sed 's/^/    /'
+"$BUILD/vm_stowaway" diff drop --name smoke >/dev/null
+
+kill $T3 2>/dev/null
+wait $T3 2>/dev/null
+"$BUILD/vm_stowaway" unpatch "$PATCHED3" libvm_stowaway_payload 2>&1 | sed 's/^/    /' \
+    || fail "unpatch"
+otool -L "$PATCHED3" 2>/dev/null | grep -q libvm_stowaway_payload \
+    && fail "unpatch: LC_LOAD_DYLIB still present"
+echo "    unpatch ok"
+
 echo "ok"

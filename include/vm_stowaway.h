@@ -83,6 +83,10 @@ void vm_stowaway_close(vm_stowaway_t *h);
 /* Underlying pid of the target. */
 pid_t vm_stowaway_pid(const vm_stowaway_t *h);
 
+/* Look up the first process whose comm or executable basename equals `name`.
+ * Returns the pid, or -1 if no match. Skips our own pid. */
+pid_t vm_stowaway_find_pid(const char *name);
+
 /* mach-o patcher. */
 
 /* Add an LC_LOAD_DYLIB to `binary` pointing at `payload_install_name`.
@@ -91,6 +95,13 @@ int vm_stowaway_patch(const char *binary,
                       const char *payload_install_name,
                       const vm_stowaway_patch_opts_t *opts,
                       char *errbuf, size_t errlen);
+
+/* Strip every LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB whose name contains `name_substr`
+ * from `binary`, in every Mach-O slice. ad-hoc resigns by default. */
+int vm_stowaway_unpatch(const char *binary,
+                        const char *name_substr,
+                        const vm_stowaway_patch_opts_t *opts,
+                        char *errbuf, size_t errlen);
 
 /* memory ops. */
 
@@ -164,6 +175,26 @@ uint64_t vm_stowaway_allocate(vm_stowaway_t *h, uint64_t size, int flags);
 
 /* Free memory previously allocated in the target. */
 int vm_stowaway_deallocate(vm_stowaway_t *h, uint64_t addr, uint64_t size);
+
+/* Invoke a function inside the target: addr(args[0]..args[nargs-1]).
+ * Up to 6 u64 args. Returns the function's return value via *out_ret. */
+int vm_stowaway_call(vm_stowaway_t *h, uint64_t addr,
+                     const uint64_t *args, uint32_t nargs,
+                     uint64_t *out_ret);
+
+/* Software breakpoints (BRK/INT3). Set returns an opaque id; clear removes the
+ * trap. wait blocks until any breakpoint fires, returning the firing bp_id, the
+ * thread id, and the pc of the trap. cont restores the original instruction at
+ * that bp and resumes the suspended thread (so the same bp will not fire again
+ * unless you re-arm). timeout_ms < 0 means wait forever; 0 = poll. */
+int vm_stowaway_break_set(vm_stowaway_t *h, uint64_t addr, uint32_t *out_bp_id);
+int vm_stowaway_break_clear(vm_stowaway_t *h, uint32_t bp_id);
+int vm_stowaway_break_wait(vm_stowaway_t *h, int timeout_ms,
+                           uint32_t *bp_id, uint64_t *tid, uint64_t *pc);
+int vm_stowaway_break_cont(vm_stowaway_t *h, uint64_t tid);
+
+/* Negotiated payload protocol version + pid. */
+int vm_stowaway_remote_info(vm_stowaway_t *h, uint32_t *version, uint64_t *pid);
 
 /* diagnostics. */
 
