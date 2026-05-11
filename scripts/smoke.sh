@@ -4,69 +4,36 @@ IFS=$'\n\t'
 
 BUILD="${1:-build}"
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YEL='\033[1;33m'
-BLU='\033[0;34m'; CYN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-CHECK="${GREEN}✔${NC}"; CROSS="${RED}✖${NC}"
-INFO="${CYN}➜${NC}"; WARN="${YEL}⚠${NC}"
-
-section() { echo; printf "${BOLD}${CYN}==> %s${NC}\n" "$1"; }
-
-run_step() {
-    local msg="$1"; shift
-    printf "${CYN}[..]${NC} %s\r" "$msg"
-    if "$@" >/tmp/vmsw-step.log 2>&1; then
-        printf "\r\033[K${CHECK} %s\n" "$msg"
-    else
-        printf "\r\033[K${CROSS} %s\n" "$msg"
-        echo "    output:"; sed 's/^/    /' /tmp/vmsw-step.log
-        exit 1
-    fi
-}
-
-banner() {
-    printf "${BOLD}${BLU}"
-    cat <<'EOF'
-                                                _
-__   ___ __ ___    ___| |_ _____      ____ ___ _   _
-\ \ / / '_ ` _ \  / __| __/ _ \ \ /\ / / _` |\ \ / /
- \ V /| | | | | | \__ \ || (_) \ V  V / (_| | \ V /
-  \_/ |_| |_| |_| |___/\__\___/ \_/\_/ \__,_|  \_/
-EOF
-    printf "${NC}\n"
-    echo -e "${CYN}smoke test (DYLD_INSERT_LIBRARIES path)${NC}\n"
-}
-
-banner
-
 TARGET="$BUILD/examples/target"
 EXAMPLE="$BUILD/examples/controller_example"
 
 if [[ ! -x "$TARGET" || ! -x "$EXAMPLE" ]]; then
-    echo -e "$CROSS missing build outputs; run \`make\` first"
+    echo "missing build outputs; run make first" >&2
     exit 1
 fi
 
-section "Verify build outputs"
-run_step "controller library" test -f "$BUILD/libvm_stowaway.a"
-run_step "payload dylib"      test -f "$BUILD/libvm_stowaway_payload.dylib"
-run_step "mach shim dylib"    test -f "$BUILD/libvm_stowaway_machshim.dylib"
-run_step "vm_stowaway CLI"    test -x "$BUILD/vm_stowaway"
-run_step "target binary"      test -x "$TARGET"
-run_step "mach_client binary" test -x "$BUILD/examples/mach_client"
+fail() { echo "FAIL: $*" >&2; exit 1; }
 
-section "DYLD_INSERT_LIBRARIES backend"
+echo "== build outputs"
+for f in "$BUILD/libvm_stowaway.a" \
+         "$BUILD/libvm_stowaway_payload.dylib" \
+         "$BUILD/libvm_stowaway_machshim.dylib" \
+         "$BUILD/vm_stowaway" \
+         "$TARGET" \
+         "$BUILD/examples/mach_client"; do
+    [[ -e "$f" ]] || fail "missing $f"
+done
+
+echo "== DYLD_INSERT_LIBRARIES backend"
 OUTPUT=$("$EXAMPLE" "$TARGET" 5 2>&1 || true)
 echo "$OUTPUT" | sed 's/^/    /'
-echo "$OUTPUT" | grep -q "after:  secret=1337 message=rewritten from outside" || {
-    echo -e "${CROSS} DYLD path: expected post-write values not observed"
-    exit 1
-}
-echo -e "${CHECK} DYLD_INSERT_LIBRARIES backend ok"
+echo "$OUTPUT" | grep -q "after:  secret=1337 message=rewritten from outside" \
+    || fail "DYLD path: post-write values not observed"
 
-section "LC_LOAD_DYLIB patcher backend"
+echo "== LC_LOAD_DYLIB patcher backend"
 PATCHED=$(mktemp -t vmsw-target.XXXXXX)
 cp "$TARGET" "$PATCHED"
-chmod +x "$PATCHED"   # mktemp creates 0600; restore exec bit
+chmod +x "$PATCHED"
 "$BUILD/vm_stowaway" patch "$PATCHED" "$PWD/$BUILD/libvm_stowaway_payload.dylib" \
     2>&1 | sed 's/^/    /'
 
@@ -77,19 +44,16 @@ trap '{ kill $TPID 2>/dev/null; wait $TPID 2>/dev/null; rm -f "$PATCHED" "$PATCH
 sleep 1
 
 ADDR=$("$BUILD/vm_stowaway" resolve $TPID secret 2>/dev/null)
-[[ -n "$ADDR" ]] || { echo -e "${CROSS} resolve failed"; exit 1; }
+[[ -n "$ADDR" ]] || fail "resolve failed"
 echo "    secret at $ADDR"
 "$BUILD/vm_stowaway" write $TPID $ADDR "39050000" | sed 's/^/    /'
 sleep 2
-if grep -q "secret=1337" "$PATCHED.out"; then
-    echo -e "${CHECK} LC_LOAD_DYLIB backend ok"
-else
-    echo -e "${CROSS} patcher path: target never observed new value"
+grep -q "secret=1337" "$PATCHED.out" || {
     sed 's/^/    /' < "$PATCHED.out"
-    exit 1
-fi
+    fail "patcher path: target never observed new value"
+}
 
-section "mach API shim (DYLD_INTERPOSE over mach_vm_*)"
+echo "== mach API shim (DYLD_INTERPOSE)"
 PATCHED2=$(mktemp -t vmsw-shimtest.XXXXXX)
 cp "$TARGET" "$PATCHED2"
 chmod +x "$PATCHED2"
@@ -103,30 +67,22 @@ sleep 1
 
 SECRET=$("$BUILD/vm_stowaway" resolve $T2 secret 2>/dev/null)
 echo "    secret @ $SECRET"
-echo "    running mach_client through shim ..."
 OUT=$("$BUILD/vm_stowaway" wrap --pid $T2 -- \
     "$BUILD/examples/mach_client" $T2 $SECRET 4 "39050000" 2>&1)
 echo "$OUT" | sed 's/^/    /'
 sleep 2
 
-fail=0
-grep -q "secret=1337" "$PATCHED2.out" || { echo "    target never observed write"; fail=1; }
-echo "$OUT" | grep -q "wrote 4 bytes"             || { echo "    no write ack";        fail=1; }
-echo "$OUT" | grep -q "^region:"                  || { echo "    no region walked";    fail=1; }
-echo "$OUT" | grep -q "dyld_all_image_infos @ 0x" || { echo "    no TASK_DYLD_INFO";   fail=1; }
-echo "$OUT" | grep -q "task_basic_info: vsz="     || { echo "    no TASK_BASIC_INFO";  fail=1; }
-echo "$OUT" | grep -q "^task_threads: "           || { echo "    no task_threads";     fail=1; }
-echo "$OUT" | grep -q " pc=0x"                    || { echo "    no thread_get_state"; fail=1; }
-echo "$OUT" | grep -q 'alloc/rt:.*round-trip'     || { echo "    no alloc round-trip"; fail=1; }
-echo "$OUT" | grep -q "^pid_for_task: "           || { echo "    no pid_for_task";    fail=1; }
-echo "$OUT" | grep -q "^vm_read_overwrite: "      || { echo "    no legacy vm_read";  fail=1; }
-echo "$OUT" | grep -q "^thread_info: ok"          || { echo "    no thread_info";     fail=1; }
-if [[ $fail -eq 0 ]]; then
-    echo -e "${CHECK} mach API shim ok"
-else
-    echo -e "${CROSS} mach API shim path failed"
-    exit 1
-fi
+want() { echo "$OUT" | grep -q "$1" || fail "shim: $2"; }
+grep -q "secret=1337" "$PATCHED2.out" || fail "target never observed write"
+want "wrote 4 bytes"             "no write ack"
+want "^region:"                  "no region walked"
+want "dyld_all_image_infos @ 0x" "no TASK_DYLD_INFO"
+want "task_basic_info: vsz="     "no TASK_BASIC_INFO"
+want "^task_threads: "           "no task_threads"
+want " pc=0x"                    "no thread_get_state"
+want 'alloc/rt:.*round-trip'     "no alloc round-trip"
+want "^pid_for_task: "           "no pid_for_task"
+want "^vm_read_overwrite: "      "no legacy vm_read"
+want "^thread_info: ok"          "no thread_info"
 
-echo
-echo -e "${CHECK} ${BOLD}smoke test passed${NC}"
+echo "ok"

@@ -1,10 +1,3 @@
-/*
- * vm_stowaway controller
- *
- * Spawn or attach to a target that hosts the payload, then talk to it
- * over a Unix domain socket using the protocol in protocol.h.
- */
-
 #define _DARWIN_C_SOURCE
 
 #include "../include/vm_stowaway.h"
@@ -46,11 +39,11 @@ static void set_err(vm_stowaway_t *h, const char *fmt, ...) {
     va_end(ap);
 }
 
-static void set_errbuf(char *errbuf, size_t errlen, const char *fmt, ...) {
-    if (!errbuf || !errlen) return;
+static void set_errbuf(char *buf, size_t len, const char *fmt, ...) {
+    if (!buf || !len) return;
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(errbuf, errlen, fmt, ap);
+    vsnprintf(buf, len, fmt, ap);
     va_end(ap);
 }
 
@@ -75,15 +68,8 @@ static int write_full(int fd, const void *buf, size_t len) {
     return 0;
 }
 
-/* -- payload path resolution ---------------------------------------------- */
-
-/* Locate libvm_stowaway_payload.dylib.
- *   1. $VM_STOWAWAY_PAYLOAD if set
- *   2. next to our own image
- *   3. one directory up from our own image (so a binary in build/examples/
- *      finds the payload in build/)
- *   4. /usr/local/lib
- */
+/* $VM_STOWAWAY_PAYLOAD, then next to our image, then one dir up (so a
+ * binary in build/examples/ finds the payload in build/), then /usr/local/lib. */
 static int default_payload_path(char *out, size_t outlen) {
     const char *env = getenv("VM_STOWAWAY_PAYLOAD");
     if (env && *env && access(env, R_OK) == 0) {
@@ -106,8 +92,6 @@ static int default_payload_path(char *out, size_t outlen) {
     if (access(out, R_OK) == 0) return 0;
     return -1;
 }
-
-/* -- socket helpers ------------------------------------------------------- */
 
 static int unique_sock_path(char *out, size_t outlen) {
     struct timespec ts;
@@ -145,8 +129,6 @@ static int connect_with_retry(const char *path, int timeout_s) {
     }
 }
 
-/* -- request/response RPC ------------------------------------------------- */
-
 static int rpc(vm_stowaway_t *h, uint32_t op,
                const void *body, size_t body_len,
                uint32_t *out_status, uint8_t **out_body, size_t *out_body_len) {
@@ -178,8 +160,8 @@ static int rpc(vm_stowaway_t *h, uint32_t op,
         set_err(h, "bad response magic");
         return -1;
     }
-    if (rhdr.payload_len > (1ull << 31)) {
-        set_err(h, "response too large");
+    if (rhdr.payload_len > (1ull << 26)) {  /* 64 MiB cap */
+        set_err(h, "response too large (%llu)", (unsigned long long)rhdr.payload_len);
         return -1;
     }
     uint8_t *buf = NULL;
@@ -217,8 +199,6 @@ static int rpc_or_err(vm_stowaway_t *h, uint32_t op,
     return 0;
 }
 
-/* -- launch --------------------------------------------------------------- */
-
 vm_stowaway_t *vm_stowaway_launch(const char *path, char *const argv[],
                                   const vm_stowaway_launch_opts_t *opts,
                                   char *errbuf, size_t errlen) {
@@ -240,24 +220,22 @@ vm_stowaway_t *vm_stowaway_launch(const char *path, char *const argv[],
     else
         unique_sock_path(sock_path, sizeof(sock_path));
 
-    /* Build env: copy environ + inherit-from-opts + our two vars. */
-    size_t base_n = 0;
-    if (opts->extra_env) {
-        while (opts->extra_env[base_n]) base_n++;
-    } else {
-        while (environ[base_n]) base_n++;
-    }
-    char **child_env = calloc(base_n + 3, sizeof(char *));
+    /* child env = environ + extra_env (extras append) + our two vars. existing
+     * DYLD_INSERT_LIBRARIES / VM_STOWAWAY_SOCK in either source are dropped. */
+    size_t env_n = 0, extra_n = 0;
+    while (environ[env_n]) env_n++;
+    if (opts->extra_env) while (opts->extra_env[extra_n]) extra_n++;
+    char **child_env = calloc(env_n + extra_n + 3, sizeof(char *));
     if (!child_env) {
         set_errbuf(errbuf, errlen, "oom");
         return NULL;
     }
-    char *const *src = opts->extra_env ? opts->extra_env : environ;
     size_t n = 0;
-    for (size_t i = 0; i < base_n; i++) {
-        if (strncmp(src[i], "DYLD_INSERT_LIBRARIES=", 22) == 0) continue;
-        if (strncmp(src[i], "VM_STOWAWAY_SOCK=", 17) == 0) continue;
-        child_env[n++] = src[i];
+    for (size_t i = 0; i < env_n + extra_n; i++) {
+        const char *v = i < env_n ? environ[i] : opts->extra_env[i - env_n];
+        if (strncmp(v, "DYLD_INSERT_LIBRARIES=", 22) == 0) continue;
+        if (strncmp(v, "VM_STOWAWAY_SOCK=", 17) == 0) continue;
+        child_env[n++] = (char *)v;
     }
     char dyld_var[1100], sock_var[300];
     snprintf(dyld_var, sizeof(dyld_var), "DYLD_INSERT_LIBRARIES=%s", payload_path);
@@ -295,8 +273,6 @@ vm_stowaway_t *vm_stowaway_launch(const char *path, char *const argv[],
     return h;
 }
 
-/* -- attach --------------------------------------------------------------- */
-
 vm_stowaway_t *vm_stowaway_attach(pid_t pid, const char *socket_path,
                                   int connect_timeout_s,
                                   char *errbuf, size_t errlen) {
@@ -332,8 +308,6 @@ pid_t vm_stowaway_pid(const vm_stowaway_t *h) { return h ? h->pid : -1; }
 const char *vm_stowaway_last_error(const vm_stowaway_t *h) {
     return h ? h->last_error : "no handle";
 }
-
-/* -- memory ops ----------------------------------------------------------- */
 
 ssize_t vm_stowaway_read(vm_stowaway_t *h, uint64_t addr, void *buf, size_t len) {
     struct vmsw_read_req req = { .addr = addr, .len = len };

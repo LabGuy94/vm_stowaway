@@ -9,29 +9,9 @@
 extern "C" {
 #endif
 
-/*
- * vm_stowaway: a tiny library for reading and writing memory of a target
- * macOS process via a dylib that runs inside it.
- *
- * Two ways to get the payload into the target:
- *
- *   1. vm_stowaway_launch(): spawn the target with DYLD_INSERT_LIBRARIES set.
- *      Simplest. Works on binaries WITHOUT hardened runtime + library
- *      validation (your own builds, unsigned tools, CTF targets, apps you
- *      have re-signed without those flags).
- *
- *   2. vm_stowaway_patch(): rewrite the target's Mach-O to add an
- *      LC_LOAD_DYLIB entry pointing at the payload, then ad-hoc re-sign.
- *      Works on hardened-runtime apps you can modify on disk. The patched
- *      binary loads the payload every time it's started, until you revert.
- *
- * After either, the payload listens on a Unix socket and the controller
- * speaks to it through this API.
- *
- * Use this for apps you have the right to modify: your own software, open
- * source apps, CTF targets, mod-friendly games. Don't use it to break ToS
- * on online services.
- */
+/* read/write memory in a macOS process via an in-target payload dylib.
+ * payload gets in via vm_stowaway_launch (DYLD_INSERT) or vm_stowaway_patch
+ * (LC_LOAD_DYLIB rewrite + ad-hoc resign). */
 
 typedef struct vm_stowaway vm_stowaway_t;
 
@@ -47,8 +27,8 @@ typedef struct {
     /* Seconds to wait for the payload to connect back. 0 -> 10s default. */
     int connect_timeout_s;
 
-    /* If non-NULL, extra environment for the child (NULL-terminated). The
-     * controller adds DYLD_INSERT_LIBRARIES and VM_STOWAWAY_SOCK on top. */
+    /* Extra env appended to the inherited environ (NULL-terminated). The
+     * controller always sets DYLD_INSERT_LIBRARIES and VM_STOWAWAY_SOCK. */
     char *const *extra_env;
 } vm_stowaway_launch_opts_t;
 
@@ -82,7 +62,7 @@ typedef struct {
     uint32_t prot;  /* VM_PROT_READ=1, WRITE=2, EXECUTE=4 */
 } vm_stowaway_region_t;
 
-/* -- lifecycle ---------------------------------------------------------- */
+/* lifecycle. */
 
 /* Spawn `path` with argv, injecting the payload via DYLD_INSERT_LIBRARIES.
  * Returns a handle, or NULL on error (errno set, errbuf filled if given). */
@@ -103,7 +83,7 @@ void vm_stowaway_close(vm_stowaway_t *h);
 /* Underlying pid of the target. */
 pid_t vm_stowaway_pid(const vm_stowaway_t *h);
 
-/* -- patcher (Mach-O LC_LOAD_DYLIB rewriting) --------------------------- */
+/* mach-o patcher. */
 
 /* Add an LC_LOAD_DYLIB to `binary` pointing at `payload_install_name`.
  * Returns 0 on success, -1 on error. */
@@ -112,7 +92,7 @@ int vm_stowaway_patch(const char *binary,
                       const vm_stowaway_patch_opts_t *opts,
                       char *errbuf, size_t errlen);
 
-/* -- memory operations -------------------------------------------------- */
+/* memory ops. */
 
 /* Read up to `len` bytes from `addr` into `buf`. Returns bytes read, or -1
  * on error. Reads use mach_vm_read_overwrite inside the target so bad
@@ -151,7 +131,7 @@ ssize_t vm_stowaway_scan(vm_stowaway_t *h,
                          size_t pat_len,
                          uint64_t *out, size_t max_hits);
 
-/* -- task / thread / allocation ----------------------------------------- */
+/* task / threads / alloc. */
 
 /* Fetch the target's task_dyld_info (address + size + format of the
  * dyld_all_image_infos struct in the target's address space). */
@@ -185,7 +165,7 @@ uint64_t vm_stowaway_allocate(vm_stowaway_t *h, uint64_t size, int flags);
 /* Free memory previously allocated in the target. */
 int vm_stowaway_deallocate(vm_stowaway_t *h, uint64_t addr, uint64_t size);
 
-/* -- diagnostics -------------------------------------------------------- */
+/* diagnostics. */
 
 const char *vm_stowaway_last_error(const vm_stowaway_t *h);
 

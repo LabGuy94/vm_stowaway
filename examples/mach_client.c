@@ -1,11 +1,5 @@
-/*
- * Tiny stand-in for a memory-inspection tool that exercises every mach
- * API the vm_stowaway shim interposes. Run it under the shim and it
- * should read + write the target's memory and walk threads / allocate /
- * inspect task info, all without holding a task_for_pid entitlement.
- *
- * usage: mach_client <pid> <addr> <len> [hex-to-write]
- */
+/* exercises every mach API the shim interposes. run via `vm_stowaway wrap`.
+ * usage: mach_client <pid> <addr> <len> [hex-to-write] */
 
 #include <ctype.h>
 #include <inttypes.h>

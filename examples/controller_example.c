@@ -1,7 +1,4 @@
-/*
- * Smoke-test controller. Launches the target, resolves its `secret` and
- * `message` globals, prints them, mutates them, and prints them again.
- */
+/* smoke-test controller: launch target, read/write its globals, verify. */
 
 #include "../include/vm_stowaway.h"
 

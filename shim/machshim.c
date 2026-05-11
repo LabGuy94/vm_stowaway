@@ -1,19 +1,8 @@
-/*
- * vm_stowaway mach API shim.
+/* DYLD_INSERT into a mem-inspection tool. Interposes task_for_pid / mach_vm_*
+ * etc for VM_STOWAWAY_TARGET_PID; calls route through the payload.
  *
- * DYLD_INSERT this dylib into a memory-inspection tool. It interposes
- * task_for_pid and the mach_vm_* functions so that, when the tool tries
- * to operate on the pid set in VM_STOWAWAY_TARGET_PID, the calls route
- * through a vm_stowaway payload already running inside the target instead
- * of into the kernel. The tool works without SIP off / debug entitlements.
- *
- * dyld does not apply our interpose to calls made from within this image,
- * so calls to e.g. task_for_pid below go to the real libSystem function.
- *
- * Env vars (set by `vm_stowaway wrap`):
- *   VM_STOWAWAY_TARGET_PID  the pid we should shim
- *   VM_STOWAWAY_SOCK        socket path; defaults to /tmp/vm_stowaway.<pid>.sock
- */
+ * Note: dyld doesn't apply interposes to calls from inside this image, so the
+ * real-libSystem fallbacks below work as-is. */
 
 #define _DARWIN_C_SOURCE
 
@@ -48,6 +37,7 @@ static int is_thread_sentinel(mach_port_t p) {
 }
 
 static int             g_target_pid = -1;
+static int             g_debug = 0;
 static vm_stowaway_t  *g_handle = NULL;
 static pthread_once_t  g_init_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t g_handle_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -63,7 +53,7 @@ static uint32_t        g_thread_count = 0;
 static pthread_mutex_t g_threads_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void log_msg(const char *fmt, ...) {
-    if (!getenv("VM_STOWAWAY_DEBUG")) return;
+    if (!g_debug) return;
     va_list ap; va_start(ap, fmt);
     fprintf(stderr, "[vm_stowaway/shim] ");
     vfprintf(stderr, fmt, ap);
@@ -72,6 +62,7 @@ static void log_msg(const char *fmt, ...) {
 }
 
 static void shim_init(void) {
+    g_debug = getenv("VM_STOWAWAY_DEBUG") != NULL;
     const char *s = getenv("VM_STOWAWAY_TARGET_PID");
     if (s) g_target_pid = atoi(s);
     log_msg("init: target_pid=%d", g_target_pid);
@@ -93,6 +84,12 @@ static vm_stowaway_t *handle(void) {
     return h;
 }
 
+static int cmp_region(const void *a, const void *b) {
+    uint64_t ba = ((const vm_stowaway_region_t *)a)->base;
+    uint64_t bb = ((const vm_stowaway_region_t *)b)->base;
+    return (ba > bb) - (ba < bb);
+}
+
 static int ensure_regions(void) {
     pthread_mutex_lock(&g_regions_mu);
     if (g_regions) { pthread_mutex_unlock(&g_regions_mu); return 0; }
@@ -103,14 +100,16 @@ static int ensure_regions(void) {
     vm_stowaway_region_t *buf = malloc(cap * sizeof(*buf));
     if (!buf) { pthread_mutex_unlock(&g_regions_mu); return -1; }
     ssize_t n = vm_stowaway_regions(h, buf, cap);
-    while (n > (ssize_t)cap) {
+    if (n > (ssize_t)cap) {
         cap = (size_t)n;
         free(buf);
         buf = malloc(cap * sizeof(*buf));
         if (!buf) { pthread_mutex_unlock(&g_regions_mu); return -1; }
         n = vm_stowaway_regions(h, buf, cap);
+        if (n > (ssize_t)cap) n = (ssize_t)cap;  /* accept truncation on race */
     }
     if (n < 0) { free(buf); pthread_mutex_unlock(&g_regions_mu); return -1; }
+    qsort(buf, (size_t)n, sizeof(*buf), cmp_region);
     g_regions = buf;
     g_n_regions = n;
     log_msg("cached %zd regions", n);
@@ -118,13 +117,16 @@ static int ensure_regions(void) {
     return 0;
 }
 
+/* lowest region r with r.base + r.size > addr, via bisect on sorted bases. */
 static const vm_stowaway_region_t *next_region(mach_vm_address_t addr) {
-    for (ssize_t i = 0; i < g_n_regions; i++)
-        if (g_regions[i].base + g_regions[i].size > addr) return &g_regions[i];
-    return NULL;
+    ssize_t lo = 0, hi = g_n_regions;
+    while (lo < hi) {
+        ssize_t m = lo + (hi - lo) / 2;
+        if (g_regions[m].base + g_regions[m].size > addr) hi = m;
+        else lo = m + 1;
+    }
+    return lo < g_n_regions ? &g_regions[lo] : NULL;
 }
-
-/* -- interposers --------------------------------------------------------- */
 
 static kern_return_t vmsw_task_for_pid(mach_port_name_t target, int pid,
                                        mach_port_name_t *t) {
@@ -271,8 +273,6 @@ static kern_return_t vmsw_mach_port_mod_refs(ipc_space_t task,
         return KERN_SUCCESS;
     return mach_port_mod_refs(task, name, right, delta);
 }
-
-/* --- task control APIs (no-op for our sentinel) --- */
 
 static kern_return_t vmsw_task_suspend(task_t task) {
     if (task == VMSW_SENTINEL_PORT) {
@@ -424,8 +424,6 @@ static kern_return_t vmsw_thread_set_state(thread_act_t thread,
     return thread_set_state(thread, flavor, state, count);
 }
 
-/* --- VM allocation / protection (sentinel path) --- */
-
 static kern_return_t vmsw_mach_vm_allocate(vm_map_t task,
                                            mach_vm_address_t *addr,
                                            mach_vm_size_t size,
@@ -469,8 +467,6 @@ static kern_return_t vmsw_mach_vm_protect(vm_map_t task,
     }
     return mach_vm_protect(task, addr, size, set_max, new_prot);
 }
-
-/* -- additional task / thread / port APIs -------------------------------- */
 
 static kern_return_t vmsw_pid_for_task(mach_port_name_t task, int *pid) {
     if (task == VMSW_SENTINEL_PORT) {
@@ -565,7 +561,7 @@ static kern_return_t vmsw_mach_port_destroy(ipc_space_t task,
     return mach_port_destroy(task, name);
 }
 
-/* --- legacy vm_* family (32-bit-named variants of mach_vm_*) --- */
+/* legacy vm_* family. */
 
 static kern_return_t vmsw_vm_read(vm_map_t task, vm_address_t addr,
                                   vm_size_t size, vm_offset_t *data,
@@ -623,8 +619,6 @@ static kern_return_t vmsw_vm_deallocate(vm_map_t task, vm_address_t addr,
 
 /* vm_region / vm_region_recurse aren't exported on macOS 12+; modern tools
  * call the mach_vm_* variants which we already interpose. */
-
-/* -- DYLD_INTERPOSE table ------------------------------------------------- */
 
 #define DYLD_INTERPOSE(_replacement, _replacee) \
     __attribute__((used)) static struct { \

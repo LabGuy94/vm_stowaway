@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# vm_stowaway installer. Clones the repo to a tmpdir, builds, installs to
-# /usr/local (or $PREFIX). Re-runs with sudo if /usr/local isn't writable.
+# clone, build, install to $PREFIX. sudos the install step if needed.
 set -euo pipefail
 
 REPO="${VMSW_REPO:-https://github.com/LabGuy94/vm_stowaway.git}"
@@ -22,7 +21,7 @@ if [[ "${1:-}" == "--prefix" && -n "${2:-}" ]]; then PREFIX="$2"; fi
 
 for cmd in git make cc codesign; do
     command -v "$cmd" >/dev/null || {
-        echo "missing $cmd — install Xcode command-line tools (xcode-select --install)"
+        echo "missing $cmd: install Xcode command-line tools (xcode-select --install)"
         exit 1
     }
 done

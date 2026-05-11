@@ -1,5 +1,3 @@
-# vm_stowaway: simple memory read/write via dylib injection on macOS
-
 NAME       := vm_stowaway
 VERSION    := 0.1.0
 
@@ -39,19 +37,16 @@ EXAMPLES := $(BUILD)/examples/target \
 .PHONY: all clean install test
 all: $(LIB_STATIC) $(LIB_DYNAMIC) $(PAYLOAD_LIB) $(SHIM_LIB) $(CLI_BIN) $(EXAMPLES)
 
-# Compile .c -> .o under build/
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-# Static library: controller + patcher (no payload; the payload runs in the
-# target). Use libtool (Apple's) instead of ar so we get a proper fat static
-# archive without ranlib warnings.
+# controller + patcher only; payload runs in the target. Apple's libtool
+# produces a fat archive without the ranlib warnings ar trips.
 $(LIB_STATIC): $(CONTROLLER_OBJ)
 	@mkdir -p $(dir $@)
-	libtool -static -o $@ $^ 2>/dev/null || $(AR) rcs $@ $^
+	libtool -static -o $@ $^
 
-# Shared controller library
 $(LIB_DYNAMIC): $(CONTROLLER_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) -dynamiclib -install_name @rpath/lib$(NAME).dylib \
@@ -59,31 +54,26 @@ $(LIB_DYNAMIC): $(CONTROLLER_OBJ)
 	    $(LDFLAGS) $^ -o $@
 	codesign --force --sign - $@
 
-# The injected payload dylib (lives inside the target process)
 $(PAYLOAD_LIB): $(PAYLOAD_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) -dynamiclib -install_name @rpath/lib$(NAME)_payload.dylib \
 	    $(LDFLAGS) -lpthread $^ -o $@
 	codesign --force --sign - $@
 
-# Mach API shim: DYLD_INSERT this into a memory-inspection tool so its
-# task_for_pid + mach_vm_* calls route through a vm_stowaway payload.
 $(SHIM_LIB): $(SHIM_OBJ) $(LIB_STATIC)
 	@mkdir -p $(dir $@)
 	$(CC) -dynamiclib -install_name @rpath/lib$(NAME)_machshim.dylib \
 	    $(LDFLAGS) $(SHIM_OBJ) $(LIB_STATIC) -lpthread -o $@
 	codesign --force --sign - $@
 
-# CLI links the static library so the binary is self-contained
 $(CLI_BIN): $(CLI_OBJ) $(LIB_STATIC)
 	@mkdir -p $(dir $@)
 	$(CC) $(LDFLAGS) $(CLI_OBJ) $(LIB_STATIC) -o $@
 	codesign --force --sign - $@
 
-# Examples: compile with default visibility so dlsym can find globals.
-# -headerpad_max_install_names gives ~16K of slack in the Mach-O header so
-# `vm_stowaway patch` has room to insert an LC_LOAD_DYLIB. Real apps usually
-# have plenty of header padding; tiny test binaries often don't.
+# -headerpad_max_install_names: room for `vm_stowaway patch` to insert an
+# LC_LOAD_DYLIB without rewriting segment offsets. Real apps usually have
+# enough header slack already; tiny test binaries don't.
 $(BUILD)/examples/target: examples/target.c
 	@mkdir -p $(dir $@)
 	$(CC) $(EXAMPLE_CFLAGS) $(LDFLAGS) -Wl,-headerpad_max_install_names $< -o $@
@@ -94,8 +84,6 @@ $(BUILD)/examples/controller_example: examples/controller_example.c $(LIB_STATIC
 	$(CC) $(EXAMPLE_CFLAGS) $(LDFLAGS) $< $(LIB_STATIC) -o $@
 	codesign --force --sign - $@
 
-# Stripped-down mach client: task_for_pid + mach_vm_read_overwrite + write.
-# Useful for testing the shim independently of any third-party tool.
 $(BUILD)/examples/mach_client: examples/mach_client.c
 	@mkdir -p $(dir $@)
 	$(CC) $(EXAMPLE_CFLAGS) $(LDFLAGS) $< -o $@

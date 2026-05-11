@@ -1,11 +1,4 @@
-/*
- * vm_stowaway payload
- *
- * Loaded into the target process either by DYLD_INSERT_LIBRARIES or by an
- * LC_LOAD_DYLIB injected via vm_stowaway_patch. On init it spawns a worker
- * thread that listens on a Unix domain socket and services memory-access
- * requests from the controller.
- */
+/* runs inside the target. listens on a unix socket and services memory ops. */
 
 #define _DARWIN_C_SOURCE
 
@@ -21,6 +14,7 @@
 #include <mach/thread_info.h>
 #include <mach/vm_region.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,10 +26,11 @@
 #include "../src/protocol.h"
 
 static int  g_listen_fd = -1;
+static int  g_debug = 0;
 static char g_sock_path[256];
 
 static void log_msg(const char *fmt, ...) {
-    if (!getenv("VM_STOWAWAY_DEBUG")) return;
+    if (!g_debug) return;
     va_list ap;
     va_start(ap, fmt);
     fprintf(stderr, "[vm_stowaway/payload %d] ", getpid());
@@ -43,8 +38,6 @@ static void log_msg(const char *fmt, ...) {
     fputc('\n', stderr);
     va_end(ap);
 }
-
-/* -- safe IO --------------------------------------------------------------- */
 
 static int read_full(int fd, void *buf, size_t len) {
     uint8_t *p = buf;
@@ -73,8 +66,6 @@ static int write_full(int fd, const void *buf, size_t len) {
     return 0;
 }
 
-/* -- response helpers ------------------------------------------------------ */
-
 static int send_response(int fd, uint32_t status, uint32_t seq,
                          const void *payload, uint64_t payload_len) {
     struct vmsw_hdr h = {
@@ -92,8 +83,6 @@ static int send_response(int fd, uint32_t status, uint32_t seq,
 static int send_error(int fd, uint32_t status, uint32_t seq, const char *msg) {
     return send_response(fd, status, seq, msg, msg ? strlen(msg) : 0);
 }
-
-/* -- ops ------------------------------------------------------------------- */
 
 static int op_ping(int fd, uint32_t seq) {
     return send_response(fd, VMSW_OK, seq, NULL, 0);
@@ -296,12 +285,15 @@ static int op_scan(int fd, uint32_t seq, const uint8_t *body, uint64_t body_len)
     memcpy(&req, body, sizeof(req));
     if (req.plen == 0 || req.plen > 1024)
         return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "bad pattern length");
+    if (req.max_hits == 0 || req.max_hits > (1u << 20))
+        return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "bad max_hits");
     if (body_len < sizeof(req) + 2 * req.plen)
         return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "truncated scan");
 
     const uint8_t *pat = body + sizeof(req);
     const uint8_t *mask = pat + req.plen;
-    /* mask all-zero means no mask -> exact match */
+    /* mask byte: 0xFF = match this byte, 0x00 = wildcard. all-0xFF -> skip the
+     * masking branch in the inner loop. */
     int has_mask = 0;
     for (size_t i = 0; i < req.plen; i++) if (mask[i] != 0xFF) { has_mask = 1; break; }
 
@@ -500,8 +492,6 @@ static int op_deallocate(int fd, uint32_t seq,
     return send_response(fd, VMSW_OK, seq, NULL, 0);
 }
 
-/* -- session loop ---------------------------------------------------------- */
-
 static int serve_one(int cfd) {
     while (1) {
         struct vmsw_hdr h;
@@ -510,7 +500,7 @@ static int serve_one(int cfd) {
             send_error(cfd, VMSW_ERR_BAD_REQUEST, h.seq, "bad magic");
             return -1;
         }
-        if (h.payload_len > (1ull << 31)) {
+        if (h.payload_len > (1ull << 26)) {  /* 64 MiB cap */
             send_error(cfd, VMSW_ERR_BAD_REQUEST, h.seq, "payload too large");
             return -1;
         }
@@ -567,10 +557,9 @@ static void *server_thread(void *unused) {
     return NULL;
 }
 
-/* -- init ------------------------------------------------------------------ */
-
 __attribute__((constructor))
 static void vm_stowaway_init(void) {
+    g_debug = getenv("VM_STOWAWAY_DEBUG") != NULL;
     const char *sock = getenv("VM_STOWAWAY_SOCK");
     if (sock && *sock) {
         snprintf(g_sock_path, sizeof(g_sock_path), "%s", sock);

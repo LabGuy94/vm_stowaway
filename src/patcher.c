@@ -1,15 +1,5 @@
-/*
- * vm_stowaway Mach-O patcher
- *
- * Inserts an LC_LOAD_DYLIB (or LC_LOAD_WEAK_DYLIB) load command into a
- * target binary in-place, using the slack space between the end of the
- * load commands and the start of the first segment's file data. Doesn't
- * grow the file, so segment offsets and code signature alignment don't
- * shift. After patching, shells out to `codesign --force --sign -` to
- * apply an ad-hoc signature.
- *
- * Handles fat (universal) binaries by patching each slice independently.
- */
+/* in-place LC_LOAD_DYLIB insertion using header padding, then ad-hoc resign.
+ * fat binaries: patch each slice. */
 
 #define _DARWIN_C_SOURCE
 
@@ -41,8 +31,6 @@ static void seterr(char *errbuf, size_t errlen, const char *fmt, ...) {
     va_end(ap);
 }
 
-/* -- file copy helper ----------------------------------------------------- */
-
 static int copy_file(const char *src, const char *dst, char *err, size_t elen) {
     int in = open(src, O_RDONLY);
     if (in < 0) { seterr(err, elen, "open(%s): %s", src, strerror(errno)); return -1; }
@@ -68,13 +56,7 @@ static int copy_file(const char *src, const char *dst, char *err, size_t elen) {
     return 0;
 }
 
-/* -- single slice patcher ------------------------------------------------- */
-
-/*
- * `data` points at the start of the slice within the mmap'd file.
- * `slice_size` is the size of the slice. Returns 0 on success, -1 on error.
- * Note: 32-bit Mach-O is not supported (return -1 with message).
- */
+/* 64-bit Mach-O only; 32-bit returns -1. */
 static int patch_slice(uint8_t *data, uint64_t slice_size,
                        const char *install_name, int weak,
                        int strip_sig,
@@ -85,16 +67,14 @@ static int patch_slice(uint8_t *data, uint64_t slice_size,
 
     uint32_t magic;
     memcpy(&magic, data, 4);
-    int swap = 0;
-    int is_64 = 0;
-    if (magic == MH_MAGIC_64)        { is_64 = 1; swap = 0; }
-    else if (magic == MH_CIGAM_64)   { is_64 = 1; swap = 1; }
+    int swap;
+    if      (magic == MH_MAGIC_64)  swap = 0;
+    else if (magic == MH_CIGAM_64)  swap = 1;
     else if (magic == MH_MAGIC || magic == MH_CIGAM) {
         seterr(err, elen, "32-bit Mach-O not supported"); return -1;
     } else {
         seterr(err, elen, "unknown magic 0x%08x", magic); return -1;
     }
-    (void)is_64;
 
     struct mach_header_64 hdr;
     memcpy(&hdr, data, sizeof(hdr));
@@ -118,7 +98,6 @@ static int patch_slice(uint8_t *data, uint64_t slice_size,
     uint8_t *lc_cur = data + sizeof(struct mach_header_64);
     uint8_t *lc_end = lc_cur + hdr.sizeofcmds;
 
-    uint32_t existing_sig_off = 0, existing_sig_size = 0;
     uint8_t *existing_sig_lc = NULL;
 
     for (uint32_t i = 0; i < hdr.ncmds && lc_cur + sizeof(struct load_command) <= lc_end; i++) {
@@ -148,10 +127,6 @@ static int patch_slice(uint8_t *data, uint64_t slice_size,
                 if (size_lo > 0 && off > 0 && off < ceiling) ceiling = off;
             }
         } else if (cmd == LC_CODE_SIGNATURE) {
-            struct linkedit_data_command led;
-            memcpy(&led, lc_cur, sizeof(led));
-            existing_sig_off = swap ? OSSwapInt32(led.dataoff) : led.dataoff;
-            existing_sig_size = swap ? OSSwapInt32(led.datasize) : led.datasize;
             existing_sig_lc = lc_cur;
         }
         lc_cur += cmdsize;
@@ -162,29 +137,22 @@ static int patch_slice(uint8_t *data, uint64_t slice_size,
     size_t new_size = sizeof(struct dylib_command) + name_len;
     new_size = (new_size + 7) & ~7ULL;  /* 8-byte align */
 
-    /* If we're not removing an existing signature LC, we just need space
-     * between hdr_end and ceiling. If we're stripping, we additionally
-     * free the bytes that the existing LC_CODE_SIGNATURE occupied. */
     uint64_t available = ceiling - hdr_end;
 
+    /* drop the LC_CODE_SIGNATURE load command if present; the signature blob
+     * in __LINKEDIT becomes unreferenced and codesign will overwrite it. */
     if (strip_sig && existing_sig_lc) {
-        /* Remove the existing LC_CODE_SIGNATURE load command by shifting
-         * everything after it leftward. The signature blob in __LINKEDIT
-         * remains in the file but is unreferenced; codesign will overwrite. */
         struct load_command lc;
         memcpy(&lc, existing_sig_lc, sizeof(lc));
         uint32_t sig_cmdsize = swap ? OSSwapInt32(lc.cmdsize) : lc.cmdsize;
-        size_t after_off = (existing_sig_lc + sig_cmdsize) - data;
         size_t tail = lc_end - (existing_sig_lc + sig_cmdsize);
         memmove(existing_sig_lc, existing_sig_lc + sig_cmdsize, tail);
-        /* Zero the freed bytes at the end. */
         memset(data + sizeof(struct mach_header_64) + hdr.sizeofcmds - sig_cmdsize,
                0, sig_cmdsize);
         hdr.ncmds      -= 1;
         hdr.sizeofcmds -= sig_cmdsize;
         hdr_end -= sig_cmdsize;
         available = ceiling - hdr_end;
-        (void)existing_sig_off; (void)existing_sig_size; (void)after_off;
     }
 
     if (available < new_size) {
@@ -236,28 +204,19 @@ static int patch_slice(uint8_t *data, uint64_t slice_size,
     return 0;
 }
 
-/* -- codesign ------------------------------------------------------------- */
-
 static int run_codesign(const char *path, char *err, size_t elen) {
     pid_t pid;
-    char *const argv1[] = { "codesign", "--remove-signature", (char *)path, NULL };
-    int rc = posix_spawnp(&pid, "codesign", NULL, NULL, argv1, environ);
+    char *const argv[] = { "codesign", "--force", "--sign", "-", (char *)path, NULL };
+    int rc = posix_spawnp(&pid, "codesign", NULL, NULL, argv, environ);
     if (rc != 0) { seterr(err, elen, "spawn codesign: %s", strerror(rc)); return -1; }
-    int st = 0; waitpid(pid, &st, 0);
-    /* Ignore failure of --remove-signature: it's fine if there was no sig. */
-
-    char *const argv2[] = { "codesign", "--force", "--sign", "-", (char *)path, NULL };
-    rc = posix_spawnp(&pid, "codesign", NULL, NULL, argv2, environ);
-    if (rc != 0) { seterr(err, elen, "spawn codesign: %s", strerror(rc)); return -1; }
+    int st = 0;
     waitpid(pid, &st, 0);
     if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
-        seterr(err, elen, "codesign --sign - failed (exit %d)", WEXITSTATUS(st));
+        seterr(err, elen, "codesign failed (exit %d)", WEXITSTATUS(st));
         return -1;
     }
     return 0;
 }
-
-/* -- entrypoint ----------------------------------------------------------- */
 
 int vm_stowaway_patch(const char *binary, const char *payload_install_name,
                       const vm_stowaway_patch_opts_t *opts,

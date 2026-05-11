@@ -1,20 +1,3 @@
-/*
- * vm_stowaway CLI
- *
- * Subcommands:
- *   patch     <binary> <payload-install-name> [--weak] [--out PATH] [--no-sign]
- *   launch    <target> -- [args...]                 (then drops into REPL)
- *   attach    <pid> [--sock PATH]                   (then drops into REPL)
- *   read      <pid> <addr> <len>
- *   write     <pid> <addr> <hex-bytes>
- *   regions   <pid>
- *   images    <pid>
- *   resolve   <pid> [image-substring] <symbol>
- *   scan      <pid> <start> <end> <hex-pattern> [--mask HEX]
- *
- * `<pid>` for read/write/etc. assumes vm_stowaway_attach by default socket.
- */
-
 #include "../include/vm_stowaway.h"
 
 #include <ctype.h>
@@ -33,21 +16,10 @@
 
 extern char **environ;
 
-#define C_RESET "\033[0m"
-#define C_BOLD  "\033[1m"
-#define C_RED   "\033[0;31m"
-#define C_GRN   "\033[0;32m"
-#define C_YEL   "\033[0;33m"
-#define C_BLU   "\033[0;34m"
-#define C_CYN   "\033[0;36m"
-
-static int g_color = 1;
-static const char *c(const char *code) { return g_color ? code : ""; }
-
 static void die(const char *fmt, ...) __attribute__((noreturn, format(printf,1,2)));
 static void die(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
-    fprintf(stderr, "%s✖%s ", c(C_RED), c(C_RESET));
+    fputs("err: ", stderr);
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
@@ -57,20 +29,12 @@ static void die(const char *fmt, ...) {
 static void info(const char *fmt, ...) __attribute__((format(printf,1,2)));
 static void info(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
-    fprintf(stderr, "%s➜%s ", c(C_CYN), c(C_RESET));
     vfprintf(stderr, fmt, ap);
     fputc('\n', stderr);
     va_end(ap);
 }
 
-static void ok(const char *fmt, ...) __attribute__((format(printf,1,2)));
-static void ok(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    fprintf(stderr, "%s✔%s ", c(C_GRN), c(C_RESET));
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
-    va_end(ap);
-}
+#define ok(...) info(__VA_ARGS__)
 
 /* parse 0x... or decimal */
 static int parse_u64(const char *s, uint64_t *out) {
@@ -119,10 +83,8 @@ static void print_hex(const uint8_t *buf, size_t len, uint64_t base) {
     }
 }
 
-/* -- subcommands ---------------------------------------------------------- */
-
 static int cmd_patch(int argc, char **argv) {
-    if (argc < 2) die("usage: vm_stowaway patch <binary> <payload-install-name> [--weak] [--out PATH] [--no-sign]");
+    if (argc < 2) die("usage: vm_stowaway patch <bin> <install-name> [--weak] [--out PATH] [--no-sign]");
     const char *binary = argv[0];
     const char *payload = argv[1];
     vm_stowaway_patch_opts_t opts = { .resign = 1, .strip_existing_sig = 1 };
@@ -167,7 +129,7 @@ static int cmd_read(int argc, char **argv) {
 }
 
 static int cmd_write(int argc, char **argv) {
-    if (argc < 3) die("usage: vm_stowaway write <pid> <addr> <hex-bytes>");
+    if (argc < 3) die("usage: vm_stowaway write <pid> <addr> <hex>");
     pid_t pid = (pid_t)atoi(argv[0]);
     uint64_t addr;
     if (parse_u64(argv[1], &addr) < 0) die("bad addr");
@@ -186,10 +148,20 @@ static int cmd_regions(int argc, char **argv) {
     if (argc < 1) die("usage: vm_stowaway regions <pid>");
     pid_t pid = (pid_t)atoi(argv[0]);
     vm_stowaway_t *h = attach_pid(pid, NULL);
-    vm_stowaway_region_t buf[4096];
-    ssize_t n = vm_stowaway_regions(h, buf, 4096);
+
+    size_t cap = 4096;
+    vm_stowaway_region_t *buf = malloc(cap * sizeof(*buf));
+    if (!buf) die("oom");
+    ssize_t n = vm_stowaway_regions(h, buf, cap);
+    if (n > (ssize_t)cap) {
+        cap = (size_t)n;
+        free(buf);
+        buf = malloc(cap * sizeof(*buf));
+        if (!buf) die("oom");
+        n = vm_stowaway_regions(h, buf, cap);
+    }
     if (n < 0) die("regions: %s", vm_stowaway_last_error(h));
-    for (ssize_t i = 0; i < n && i < 4096; i++) {
+    for (ssize_t i = 0; i < n; i++) {
         char p[4] = "---";
         if (buf[i].prot & 1) p[0] = 'r';
         if (buf[i].prot & 2) p[1] = 'w';
@@ -200,6 +172,7 @@ static int cmd_regions(int argc, char **argv) {
                p,
                (unsigned long long)buf[i].size);
     }
+    free(buf);
     vm_stowaway_close(h);
     return 0;
 }
@@ -208,20 +181,31 @@ static int cmd_images(int argc, char **argv) {
     if (argc < 1) die("usage: vm_stowaway images <pid>");
     pid_t pid = (pid_t)atoi(argv[0]);
     vm_stowaway_t *h = attach_pid(pid, NULL);
-    vm_stowaway_image_t buf[2048];
-    ssize_t n = vm_stowaway_images(h, buf, 2048);
+
+    size_t cap = 1024;
+    vm_stowaway_image_t *buf = malloc(cap * sizeof(*buf));
+    if (!buf) die("oom");
+    ssize_t n = vm_stowaway_images(h, buf, cap);
+    if (n > (ssize_t)cap) {
+        cap = (size_t)n;
+        free(buf);
+        buf = malloc(cap * sizeof(*buf));
+        if (!buf) die("oom");
+        n = vm_stowaway_images(h, buf, cap);
+    }
     if (n < 0) die("images: %s", vm_stowaway_last_error(h));
-    for (ssize_t i = 0; i < n && i < 2048; i++)
+    for (ssize_t i = 0; i < n; i++)
         printf("%016llx  slide=%016llx  %s\n",
                (unsigned long long)buf[i].base,
                (unsigned long long)buf[i].slide,
                buf[i].path);
+    free(buf);
     vm_stowaway_close(h);
     return 0;
 }
 
 static int cmd_resolve(int argc, char **argv) {
-    if (argc < 2) die("usage: vm_stowaway resolve <pid> [image-substring] <symbol>");
+    if (argc < 2) die("usage: vm_stowaway resolve <pid> [image] <symbol>");
     pid_t pid = (pid_t)atoi(argv[0]);
     const char *image = argc == 2 ? NULL : argv[1];
     const char *sym = argc == 2 ? argv[1] : argv[2];
@@ -234,7 +218,7 @@ static int cmd_resolve(int argc, char **argv) {
 }
 
 static int cmd_scan(int argc, char **argv) {
-    if (argc < 4) die("usage: vm_stowaway scan <pid> <start> <end> <hex-pattern> [--mask HEX]");
+    if (argc < 4) die("usage: vm_stowaway scan <pid> <start> <end> <hex-pat> [--mask HEX]");
     pid_t pid = (pid_t)atoi(argv[0]);
     uint64_t start, end;
     if (parse_u64(argv[1], &start) < 0) die("bad start");
@@ -261,39 +245,36 @@ static int cmd_scan(int argc, char **argv) {
     return 0;
 }
 
-static int cmd_launch(int argc, char **argv) {
-    if (argc < 1) die("usage: vm_stowaway launch <target> [args...]");
-    char err[512] = {0};
-    vm_stowaway_launch_opts_t opts = {0};
-    vm_stowaway_t *h = vm_stowaway_launch(argv[0], argv, &opts, err, sizeof(err));
-    if (!h) die("launch: %s", err);
-    ok("launched pid %d, payload connected", vm_stowaway_pid(h));
-
-    /* Tiny REPL so the user can experiment. */
-    info("commands: r <addr> <len> | w <addr> <hex> | i | g | q");
+static void repl(vm_stowaway_t *h) {
+    info("commands: r <addr> <len> | w <addr> <hex> | i | g <sym> | q");
     char line[1024];
-    while (printf("%s>%s ", c(C_BLU), c(C_RESET)), fflush(stdout),
+    while (fputs("> ", stdout), fflush(stdout),
            fgets(line, sizeof(line), stdin)) {
         char *p = line;
         while (*p && isspace((unsigned char)*p)) p++;
         if (!*p) continue;
         if (*p == 'q') break;
-        if (*p == 'i') { vm_stowaway_image_t buf[8]; ssize_t n = vm_stowaway_images(h, buf, 8);
-            for (ssize_t i=0;i<n && i<8;i++) printf("  %s\n", buf[i].path);
+        if (*p == 'i') {
+            vm_stowaway_image_t buf[8];
+            ssize_t n = vm_stowaway_images(h, buf, 8);
+            for (ssize_t i = 0; i < n && i < 8; i++) printf("  %s\n", buf[i].path);
             printf("  ... (%zd total)\n", n);
             continue;
         }
         if (*p == 'g') {
-            uint64_t a; char s[256];
-            if (sscanf(p+1, " %255s", s) != 1) { printf("usage: g <symbol>\n"); continue; }
-            a = vm_stowaway_resolve(h, NULL, s);
-            printf("%016llx\n", (unsigned long long)a);
+            char s[256];
+            if (sscanf(p + 1, " %255s", s) != 1) { printf("usage: g <symbol>\n"); continue; }
+            printf("%016llx\n", (unsigned long long)vm_stowaway_resolve(h, NULL, s));
             continue;
         }
         if (*p == 'r') {
-            uint64_t a, n;
-            if (sscanf(p+1, " %lli %lli", (long long*)&a, (long long*)&n) != 2) {
+            char as[64], ns[64];
+            if (sscanf(p + 1, " %63s %63s", as, ns) != 2) {
                 printf("usage: r <addr> <len>\n"); continue;
+            }
+            uint64_t a, n;
+            if (parse_u64(as, &a) < 0 || parse_u64(ns, &n) < 0) {
+                printf("bad number\n"); continue;
             }
             uint8_t *buf = malloc((size_t)n);
             ssize_t got = vm_stowaway_read(h, a, buf, (size_t)n);
@@ -303,10 +284,12 @@ static int cmd_launch(int argc, char **argv) {
             continue;
         }
         if (*p == 'w') {
-            uint64_t a; char hex[2048];
-            if (sscanf(p+1, " %lli %2047s", (long long*)&a, hex) != 2) {
+            char as[64], hex[2048];
+            if (sscanf(p + 1, " %63s %2047s", as, hex) != 2) {
                 printf("usage: w <addr> <hex>\n"); continue;
             }
+            uint64_t a;
+            if (parse_u64(as, &a) < 0) { printf("bad addr\n"); continue; }
             uint8_t *b; size_t bl;
             if (parse_hex(hex, &b, &bl) < 0) { printf("bad hex\n"); continue; }
             ssize_t w = vm_stowaway_write(h, a, b, bl);
@@ -317,6 +300,16 @@ static int cmd_launch(int argc, char **argv) {
         }
         printf("unknown command\n");
     }
+}
+
+static int cmd_launch(int argc, char **argv) {
+    if (argc < 1) die("usage: vm_stowaway launch <target> [args...]");
+    char err[512] = {0};
+    vm_stowaway_launch_opts_t opts = {0};
+    vm_stowaway_t *h = vm_stowaway_launch(argv[0], argv, &opts, err, sizeof(err));
+    if (!h) die("launch: %s", err);
+    ok("launched pid %d, payload connected", vm_stowaway_pid(h));
+    repl(h);
     vm_stowaway_close(h);
     return 0;
 }
@@ -481,45 +474,31 @@ static int cmd_attach(int argc, char **argv) {
     }
     vm_stowaway_t *h = attach_pid(pid, sock);
     ok("attached to pid %d", pid);
-    /* Drop into the same little REPL as launch. */
-    char *no_argv[] = { NULL };
-    (void)no_argv;
-    info("commands: r <addr> <len> | w <addr> <hex> | i | g | q");
-    char line[1024];
-    while (printf("%s>%s ", c(C_BLU), c(C_RESET)), fflush(stdout),
-           fgets(line, sizeof(line), stdin)) {
-        if (line[0] == 'q') break;
-        /* For brevity, attach mode shares only basic ops; users should call
-         * the read/write subcommands for scripted use. */
-        printf("(use the read/write/scan subcommands; tiny repl here)\n");
-        break;
-    }
+    repl(h);
     vm_stowaway_close(h);
     return 0;
 }
 
-/* -- main ----------------------------------------------------------------- */
-
 static void usage(void) {
-    printf("vm_stowaway: read/write memory in a macos process via a dylib payload\n\n");
-    printf("usage: vm_stowaway <command> [args...]\n\n");
-    printf("commands:\n");
-    printf("  launch  <target> [args...]         spawn target with payload via DYLD_INSERT_LIBRARIES\n");
-    printf("  patch   <bin> <install-name>       add LC_LOAD_DYLIB to bin so payload loads on its own\n");
-    printf("            [--weak] [--out PATH] [--no-sign]\n");
-    printf("  wrap    --pid PID [--sock PATH] [--shim PATH] -- <tool> [args...]\n");
-    printf("                                     launch <tool> with the mach shim DYLD_INSERTed\n");
-    printf("  attach  <pid> [--sock PATH]        connect to a running process that already has payload\n");
-    printf("  read    <pid> <addr> <len>\n");
-    printf("  write   <pid> <addr> <hex>\n");
-    printf("  regions <pid>\n");
-    printf("  images  <pid>\n");
-    printf("  resolve <pid> [image] <symbol>\n");
-    printf("  scan    <pid> <start> <end> <hex-pat> [--mask HEX]\n\n");
+    fputs(
+        "usage: vm_stowaway <command> [args...]\n"
+        "\n"
+        "  launch  <target> [args...]              spawn target with payload via DYLD_INSERT_LIBRARIES\n"
+        "  patch   <bin> <install-name>            add LC_LOAD_DYLIB to bin so payload loads on its own\n"
+        "            [--weak] [--out PATH] [--no-sign]\n"
+        "  wrap    --pid PID [--sock PATH] [--shim PATH] [--copy DEST.app] -- <tool> [args...]\n"
+        "                                          launch <tool> with the mach shim DYLD_INSERTed\n"
+        "  attach  <pid> [--sock PATH]             connect to a process that already has payload\n"
+        "  read    <pid> <addr> <len>\n"
+        "  write   <pid> <addr> <hex>\n"
+        "  regions <pid>\n"
+        "  images  <pid>\n"
+        "  resolve <pid> [image] <symbol>\n"
+        "  scan    <pid> <start> <end> <hex-pat> [--mask HEX]\n",
+        stdout);
 }
 
 int main(int argc, char **argv) {
-    if (!isatty(STDERR_FILENO)) g_color = 0;
     if (argc < 2) { usage(); return 1; }
     const char *cmd = argv[1];
     int sub_argc = argc - 2;

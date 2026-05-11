@@ -1,10 +1,4 @@
-/*
- * Smoke-test target. Exposes a couple of global symbols and prints them
- * every second so the controller can verify reads/writes from outside.
- *
- * Built without hardened runtime / library validation, so the payload
- * loads via DYLD_INSERT_LIBRARIES with no extra ceremony.
- */
+/* smoke-test target: print a couple of globals each second. */
 
 #include <stdio.h>
 #include <stdlib.h>
