@@ -117,6 +117,14 @@ static int ensure_regions(void) {
     return 0;
 }
 
+static void invalidate_regions(void) {
+    pthread_mutex_lock(&g_regions_mu);
+    free(g_regions);
+    g_regions = NULL;
+    g_n_regions = 0;
+    pthread_mutex_unlock(&g_regions_mu);
+}
+
 /* lowest region r with r.base + r.size > addr, via bisect on sorted bases. */
 static const vm_stowaway_region_t *next_region(mach_vm_address_t addr) {
     ssize_t lo = 0, hi = g_n_regions;
@@ -434,6 +442,7 @@ static kern_return_t vmsw_mach_vm_allocate(vm_map_t task,
         uint64_t a = vm_stowaway_allocate(h, size, flags);
         if (!a) return KERN_FAILURE;
         *addr = (mach_vm_address_t)a;
+        invalidate_regions();
         log_msg("mach_vm_allocate(sentinel, size=%llu) -> 0x%llx", size, a);
         return KERN_SUCCESS;
     }
@@ -446,6 +455,7 @@ static kern_return_t vmsw_mach_vm_deallocate(vm_map_t task,
     if (task == VMSW_SENTINEL_PORT) {
         vm_stowaway_t *h = handle();
         if (h) vm_stowaway_deallocate(h, addr, size);
+        invalidate_regions();
         log_msg("mach_vm_deallocate(sentinel, 0x%llx, %llu)", addr, size);
         return KERN_SUCCESS;
     }

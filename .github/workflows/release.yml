@@ -1,0 +1,53 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'tag name (e.g. v0.1.0)'
+        required: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        run: make -j"$(sysctl -n hw.ncpu)"
+
+      - name: smoke test
+        run: make test
+
+      - name: package
+        run: |
+          TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          OUT="vm_stowaway-${TAG}-macos-universal"
+          mkdir -p "$OUT/bin" "$OUT/lib" "$OUT/include"
+          cp build/vm_stowaway "$OUT/bin/"
+          cp build/libvm_stowaway.a "$OUT/lib/"
+          cp build/libvm_stowaway.dylib "$OUT/lib/"
+          cp build/libvm_stowaway_payload.dylib "$OUT/lib/"
+          cp build/libvm_stowaway_machshim.dylib "$OUT/lib/"
+          cp include/vm_stowaway.h "$OUT/include/"
+          cp LICENSE README.md "$OUT/"
+          tar czf "$OUT.tar.gz" "$OUT"
+          shasum -a 256 "$OUT.tar.gz" > "$OUT.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vm_stowaway-macos-universal
+          path: |
+            vm_stowaway-*.tar.gz
+            vm_stowaway-*.tar.gz.sha256
+
+      - name: release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            vm_stowaway-*.tar.gz
+            vm_stowaway-*.tar.gz.sha256
+          generate_release_notes: true

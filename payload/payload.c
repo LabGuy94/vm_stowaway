@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
+#include <mach/exc.h>             /* MIG client: exception_raise (32-bit codes) */
 #include <mach/exception_types.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -584,6 +585,18 @@ static pthread_cond_t   g_hits_cv = PTHREAD_COND_INITIALIZER;
 static mach_port_t g_exc_port = MACH_PORT_NULL;
 static int         g_exc_inited = 0;
 
+/* prior task-level BREAKPOINT handler we displaced; forward misses to it. */
+static struct {
+    exception_mask_t       masks[EXC_TYPES_COUNT];
+    mach_port_t            ports[EXC_TYPES_COUNT];
+    exception_behavior_t   behaviors[EXC_TYPES_COUNT];
+    thread_state_flavor_t  flavors[EXC_TYPES_COUNT];
+    mach_msg_type_number_t count;
+} g_prior_exc;
+
+/* range of our own image, so we can refuse to set a bp inside it. */
+static uintptr_t g_self_lo, g_self_hi;
+
 static int write_bytes(uint64_t addr, const void *data, size_t len) {
     kern_return_t kr = mach_vm_protect(mach_task_self(), addr, len, FALSE,
                                        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
@@ -594,22 +607,43 @@ static int write_bytes(uint64_t addr, const void *data, size_t len) {
     return 0;
 }
 
+/* find the prior handler covering `exc`. Returns MACH_PORT_NULL if none. */
+static mach_port_t prior_handler_for(exception_type_t exc) {
+    for (mach_msg_type_number_t i = 0; i < g_prior_exc.count; i++)
+        if (g_prior_exc.masks[i] & (1 << exc)) return g_prior_exc.ports[i];
+    return MACH_PORT_NULL;
+}
+
+static void reply_kr(mach_msg_header_t *req, kern_return_t kr) {
+    struct {
+        mach_msg_header_t Head;
+        NDR_record_t      NDR;
+        kern_return_t     RetCode;
+    } rep = {0};
+    rep.Head.msgh_bits        = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(req->msgh_bits), 0);
+    rep.Head.msgh_remote_port = req->msgh_remote_port;
+    rep.Head.msgh_local_port  = MACH_PORT_NULL;
+    rep.Head.msgh_id          = req->msgh_id + 100;
+    rep.Head.msgh_size        = sizeof(rep);
+    rep.NDR                   = NDR_record;
+    rep.RetCode               = kr;
+    mach_msg(&rep.Head, MACH_SEND_MSG, sizeof(rep), 0,
+             MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+}
+
 static void *exc_thread(void *unused) {
     (void)unused;
-    /* Dispatch loop. Use the MIG-generated server from mach_excServer; but to
-     * avoid pulling that in, we hand-decode the minimal exception_raise_state
-     * format. mach_msg + parse + reply. */
     for (;;) {
         struct {
             mach_msg_header_t Head;
-            /* body: NDR + exception + codeCnt + codes... */
             mach_msg_body_t   msgh_body;
             mach_msg_port_descriptor_t thread;
             mach_msg_port_descriptor_t task;
             NDR_record_t      NDR;
             exception_type_t  exception;
             mach_msg_type_number_t codeCnt;
-            int64_t           code[2];
+            int32_t           code[2];
+            char              trailer[64];
         } req;
         memset(&req, 0, sizeof(req));
         mach_msg_return_t mr = mach_msg(&req.Head, MACH_RCV_MSG, 0, sizeof(req),
@@ -624,8 +658,8 @@ static void *exc_thread(void *unused) {
         task_t       tk = req.task.name;
         exception_type_t exc = req.exception;
         (void)tk;
-        log_msg("exception %d on thread 0x%x", exc, th);
 
+        /* find pc + check if we own the breakpoint at that pc. */
         uint32_t bp_id = 0;
         uint64_t pc = 0, tid = 0;
         if (exc == BREAK_EXC_TYPE) {
@@ -638,7 +672,7 @@ static void *exc_thread(void *unused) {
             x86_thread_state64_t s;
             mach_msg_type_number_t n = x86_THREAD_STATE64_COUNT;
             if (thread_get_state(th, x86_THREAD_STATE64, (thread_state_t)&s, &n) == KERN_SUCCESS)
-                pc = s.__rip - 1;  /* int3 leaves rip past the trap byte */
+                pc = s.__rip - 1;
 #endif
             thread_identifier_info_data_t ti;
             mach_msg_type_number_t tc = THREAD_IDENTIFIER_INFO_COUNT;
@@ -652,37 +686,59 @@ static void *exc_thread(void *unused) {
             pthread_mutex_unlock(&g_bp_mu);
         }
 
-        /* Suspend the offending thread. The controller resumes via BREAK_CONT. */
-        thread_suspend(th);
+        /* Not ours: forward to whoever had this exception class before us
+         * (crash reporter, sentry, etc), or fail loud so the kernel falls
+         * through to the host port. */
+        if (bp_id == 0) {
+            mach_port_t prior = prior_handler_for(exc);
+            if (prior != MACH_PORT_NULL) {
+                exception_data_type_t codes[2] = { req.code[0], req.code[1] };
+                kern_return_t fkr = exception_raise(
+                    prior, th, tk, exc, codes, req.codeCnt);
+                reply_kr(&req.Head, fkr);
+            } else {
+                reply_kr(&req.Head, KERN_FAILURE);
+            }
+            mach_port_deallocate(mach_task_self(), th);
+            mach_port_deallocate(mach_task_self(), tk);
+            continue;
+        }
 
+        /* Ours: suspend and queue. */
+        thread_suspend(th);
+        int queued = 0;
         pthread_mutex_lock(&g_hits_mu);
         if (g_hits_tail - g_hits_head < HIT_QUEUE_CAP) {
             g_hits[g_hits_tail++ % HIT_QUEUE_CAP] = (struct bp_hit){ bp_id, tid, pc, th };
             pthread_cond_signal(&g_hits_cv);
-        } else {
-            /* queue full; drop and let the thread continue */
+            queued = 1;
+        }
+        pthread_mutex_unlock(&g_hits_mu);
+        if (!queued) {
             thread_resume(th);
             mach_port_deallocate(mach_task_self(), th);
         }
-        pthread_mutex_unlock(&g_hits_mu);
-
-        /* Reply so the kernel doesn't wedge expecting our ack. */
-        struct {
-            mach_msg_header_t Head;
-            NDR_record_t      NDR;
-            kern_return_t     RetCode;
-        } rep = {0};
-        rep.Head.msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(req.Head.msgh_bits), 0);
-        rep.Head.msgh_remote_port = req.Head.msgh_remote_port;
-        rep.Head.msgh_local_port = MACH_PORT_NULL;
-        rep.Head.msgh_id = req.Head.msgh_id + 100;
-        rep.Head.msgh_size = sizeof(rep);
-        rep.NDR = NDR_record;
-        rep.RetCode = KERN_SUCCESS;
-        mach_msg(&rep.Head, MACH_SEND_MSG, sizeof(rep), 0,
-                 MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+        mach_port_deallocate(mach_task_self(), tk);
+        reply_kr(&req.Head, KERN_SUCCESS);
     }
     return NULL;
+}
+
+/* Approximate the address range of our own image so break_set can refuse to
+ * write a trap inside the payload (deadlock). */
+static void compute_self_range(void) {
+    Dl_info info;
+    if (!dladdr((void *)compute_self_range, &info) || !info.dli_fbase) return;
+    g_self_lo = (uintptr_t)info.dli_fbase;
+    /* No size from dladdr; scan dyld images for the matching base and use the
+     * gap to the next image as an upper bound (good enough; payload is small). */
+    uint32_t n = _dyld_image_count();
+    uintptr_t next = UINTPTR_MAX;
+    for (uint32_t i = 0; i < n; i++) {
+        uintptr_t b = (uintptr_t)_dyld_get_image_header(i);
+        if (b > g_self_lo && b < next) next = b;
+    }
+    g_self_hi = next == UINTPTR_MAX ? g_self_lo + 0x100000 : next;
 }
 
 static int ensure_exc_thread(void) {
@@ -693,11 +749,24 @@ static int ensure_exc_thread(void) {
     kr = mach_port_insert_right(mach_task_self(), g_exc_port, g_exc_port,
                                 MACH_MSG_TYPE_MAKE_SEND);
     if (kr != KERN_SUCCESS) return -1;
+
+    /* Remember whoever was handling BREAKPOINT before us so we can forward
+     * exceptions we don't own (other people's traps, third-party crash
+     * reporters, etc). */
+    g_prior_exc.count = EXC_TYPES_COUNT;
+    task_get_exception_ports(mach_task_self(), EXC_MASK_BREAKPOINT,
+                             g_prior_exc.masks, &g_prior_exc.count,
+                             g_prior_exc.ports, g_prior_exc.behaviors,
+                             g_prior_exc.flavors);
+
     kr = task_set_exception_ports(mach_task_self(),
                                   EXC_MASK_BREAKPOINT, g_exc_port,
-                                  EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
+                                  EXCEPTION_DEFAULT,
                                   THREAD_STATE_NONE);
     if (kr != KERN_SUCCESS) return -1;
+
+    compute_self_range();
+
     pthread_t t;
     pthread_attr_t a;
     pthread_attr_init(&a);
@@ -718,6 +787,10 @@ static int op_break_set(int fd, uint32_t seq, const uint8_t *body, uint64_t body
     memcpy(&req, body, sizeof(req));
     if (ensure_exc_thread() < 0)
         return send_error(fd, VMSW_ERR_INTERNAL, seq, "exception port setup failed");
+
+    if (g_self_lo && req.addr >= g_self_lo && req.addr < g_self_hi)
+        return send_error(fd, VMSW_ERR_BAD_REQUEST, seq,
+                          "refusing to set breakpoint inside payload image");
 
     pthread_mutex_lock(&g_bp_mu);
     int slot = -1;

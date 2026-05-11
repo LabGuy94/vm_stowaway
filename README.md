@@ -11,13 +11,21 @@ there's also a `DYLD_INTERPOSE` shim so existing memory tools (anything calling 
 
 ## install
 
+prebuilt universal binary from the latest release:
+
+```
+curl -fsSL https://github.com/LabGuy94/vm_stowaway/releases/latest/download/vm_stowaway-macos-universal.tar.gz | sudo tar xz -C /usr/local --strip-components=1
+```
+
+or build from source (needs xcode CLI tools):
+
 ```
 curl -fsSL https://raw.githubusercontent.com/LabGuy94/vm_stowaway/master/install.sh | bash
+# or:
+git clone https://github.com/LabGuy94/vm_stowaway && cd vm_stowaway && make && sudo make install
 ```
 
-builds from source and installs to `/usr/local` (will `sudo` if needed). macOS 11+, universal (arm64 + x86_64). xcode CLI tools required (`xcode-select --install`)
-
-or from source: `git clone https://github.com/LabGuy94/vm_stowaway && cd vm_stowaway && make && sudo make install`
+macOS 11+, universal (arm64 + x86_64).
 
 ## usage
 
@@ -44,6 +52,18 @@ vm_stowaway call 1234 libsystem_c.dylib+0xabc 1 2 3
 vm_stowaway break set 1234 main+0x40
 vm_stowaway break wait 1234
 vm_stowaway break cont 1234 <tid>
+
+# find apps already shipping with disable-library-validation + allow-dyld-environment
+# (i.e. ones plain `launch` works against without any binary modification)
+vm_stowaway scan-targets
+
+# find Mach-O hijack candidates (writable paths where dropping a dylib makes
+# the target load it as a missing dependency)
+vm_stowaway scan-hijacks /Applications/Some.app/Contents/MacOS/Some
+vm_stowaway hijack /Applications/Some.app/Contents/MacOS/Some --pick 0
+
+# copy a hardened-runtime .app and ad-hoc resign it without hardened runtime
+vm_stowaway unharden /Applications/Some.app /tmp/Some-open.app
 
 # tool's task_for_pid + mach_vm_* for pid 1234 routed through the payload
 vm_stowaway wrap --pid 1234 -- /Applications/BitSlicer.app/Contents/MacOS/BitSlicer

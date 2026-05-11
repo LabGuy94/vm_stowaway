@@ -103,6 +103,27 @@ int vm_stowaway_unpatch(const char *binary,
                         const vm_stowaway_patch_opts_t *opts,
                         char *errbuf, size_t errlen);
 
+/* Hijack candidates: paths where dropping a dylib would make the target load
+ * it as a (weak) dependency, without modifying the target binary. */
+typedef struct {
+    char path[1024];   /* absolute filesystem path to drop the payload at */
+    char dep_name[256];/* the dependency string as it appears in the binary */
+    int  weak;         /* 1 if the dep was LC_LOAD_WEAK_DYLIB */
+} vm_stowaway_hijack_t;
+
+/* Enumerate hijack candidates in `binary`. Writes up to `max`, returns total
+ * (which may exceed `max`). Looks for:
+ *   - LC_LOAD_WEAK_DYLIB whose absolute path does not exist on disk
+ *   - @rpath/X where no LC_RPATH contains an existing X (drops at the first
+ *     LC_RPATH that's writable) */
+ssize_t vm_stowaway_scan_hijacks(const char *binary,
+                                 vm_stowaway_hijack_t *out, size_t max,
+                                 char *errbuf, size_t errlen);
+
+/* Copy `payload_path` to `dest`, mkdir-p the parent, ad-hoc resign. */
+int vm_stowaway_hijack_drop(const char *payload_path, const char *dest,
+                            char *errbuf, size_t errlen);
+
 /* memory ops. */
 
 /* Read up to `len` bytes from `addr` into `buf`. Returns bytes read, or -1
