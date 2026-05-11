@@ -9,3 +9,4 @@ examples/controller_example
 cli/vm_stowaway
 compile_commands.json
 .cache/
+*.profraw
