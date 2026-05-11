@@ -14,7 +14,7 @@ CFLAGS     += $(COMMON_CFLAGS) -fvisibility=hidden -fPIC
 EXAMPLE_CFLAGS := -O2 -g $(COMMON_CFLAGS)
 LDFLAGS    += $(ARCHFLAGS) -mmacosx-version-min=11.0
 
-CONTROLLER_SRC := src/controller.c src/patcher.c
+CONTROLLER_SRC := src/controller.c src/patcher.c src/scanner.c
 PAYLOAD_SRC    := payload/payload.c
 CLI_SRC        := cli/vm_stowaway.c
 SHIM_SRC       := shim/machshim.c

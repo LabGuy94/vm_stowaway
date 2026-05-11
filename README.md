@@ -79,7 +79,16 @@ vm_stowaway_patch("/path/to/binary", "@rpath/libvm_stowaway_payload.dylib",
                   &opts, err, sizeof err);
 ```
 
-the full surface is in [`include/vm_stowaway.h`](include/vm_stowaway.h): `_read`, `_write`, `_resolve`, `_images`, `_regions`, `_scan`, `_threads`, `_thread_get_state`/`_set_state`, `_allocate`/`_deallocate`, `_call`, `_break_set`/`_wait`/`_clear`/`_cont`, `_dyld_info`, `_patch`/`_unpatch`, `_scan_hijacks`/`_hijack_drop`, `_find_pid`. examples in [`examples/controller_example.c`](examples/controller_example.c) (launch + read/write) and [`examples/attach_example.c`](examples/attach_example.c) (attach + call).
+the full surface is in [`include/vm_stowaway.h`](include/vm_stowaway.h):
+
+- handle: `_launch`, `_attach`, `_close`, `_pid`, `_find_pid`, `_remote_info`, `_last_error`
+- memory: `_read`, `_write`, `_resolve`, `_images`, `_regions`, `_scan`
+- task/threads: `_dyld_info`, `_threads`, `_thread_get_state`/`_set_state`, `_allocate`/`_deallocate`
+- code: `_call`, `_break_set`/`_wait`/`_clear`/`_cont`
+- patcher: `_patch`/`_unpatch`, `_scan_hijacks`/`_hijack_drop`
+- bundle scanners: `_scan_apps` (hardened + permissive), `_scan_electron`, `_find_app_bundle`, `_unharden`
+
+examples in [`examples/controller_example.c`](examples/controller_example.c) (launch + read/write) and [`examples/attach_example.c`](examples/attach_example.c) (attach + call).
 
 ## shim
 

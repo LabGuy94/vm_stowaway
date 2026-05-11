@@ -124,6 +124,48 @@ ssize_t vm_stowaway_scan_hijacks(const char *binary,
 int vm_stowaway_hijack_drop(const char *payload_path, const char *dest,
                             char *errbuf, size_t errlen);
 
+/* App bundle scanners. These are filesystem-only — they don't need a payload
+ * or attached process. */
+
+typedef struct {
+    char path[1024];      /* /Applications/Some.app */
+    int  allow_dyld_env;  /* com.apple.security.cs.allow-dyld-environment-variables */
+    int  disable_lib_val; /* com.apple.security.cs.disable-library-validation */
+} vm_stowaway_app_t;
+
+/* Walk `dir` (NULL -> /Applications) up to 4 levels deep. For each .app
+ * bundle, parse the main executable's entitlements. If permissive_only is
+ * non-zero, emit only bundles with allow_dyld_env && disable_lib_val
+ * (i.e. ones plain `launch` works against without binary modification).
+ * Writes up to `max`, returns total (may exceed max). */
+ssize_t vm_stowaway_scan_apps(const char *dir, int permissive_only,
+                              vm_stowaway_app_t *out, size_t max,
+                              char *errbuf, size_t errlen);
+
+typedef struct {
+    char path[1024];   /* the .app */
+    int  run_as_node;  /* 1 = fuse enabled, 0 = disabled, -1 = no fuse / unknown */
+} vm_stowaway_electron_t;
+
+/* Walk `dir` (NULL -> /Applications) one level deep. Emit each .app that
+ * embeds Electron Framework.framework, with the parsed ELECTRON_RUN_AS_NODE
+ * fuse state. Writes up to `max`, returns total. */
+ssize_t vm_stowaway_scan_electron(const char *dir,
+                                  vm_stowaway_electron_t *out, size_t max,
+                                  char *errbuf, size_t errlen);
+
+/* Walk up from `path` to find the nearest enclosing .app bundle. Returns 0
+ * and writes the bundle path (no trailing slash) to `out`, or -1 if no
+ * ancestor ends in ".app". */
+int vm_stowaway_find_app_bundle(const char *path, char *out, size_t outlen);
+
+/* Copy `src_app` -> `dst_app`, clear xattrs, strip signature, ad-hoc
+ * re-sign --deep without hardened runtime. After this, plain `launch` (i.e.
+ * DYLD_INSERT_LIBRARIES) works against the copy. Requires `cp`, `xattr`,
+ * `codesign` in PATH (i.e. xcode CLI tools). */
+int vm_stowaway_unharden(const char *src_app, const char *dst_app,
+                         char *errbuf, size_t errlen);
+
 /* memory ops. */
 
 /* Read up to `len` bytes from `addr` into `buf`. Returns bytes read, or -1

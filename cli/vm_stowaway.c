@@ -774,66 +774,8 @@ static int default_shim_path(char *out, size_t outlen) {
     return access(out, R_OK) == 0 ? 0 : -1;
 }
 
-/* Run an external command via posix_spawnp. Returns 0 on success. */
-static int run(const char *prog, char *const argv[]) {
-    pid_t pid;
-    int rc = posix_spawnp(&pid, prog, NULL, NULL, argv, environ);
-    if (rc != 0) return rc;
-    int st = 0;
-    waitpid(pid, &st, 0);
-    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
-}
-
-/* Walk up from a path until we find a parent directory whose name ends in
- * ".app". Returns 0 and writes the bundle path into `out` (without trailing
- * slash), or -1 if no .app ancestor was found. */
-static int find_app_bundle(const char *path, char *out, size_t outlen) {
-    char buf[2048];
-    snprintf(buf, sizeof(buf), "%s", path);
-    while (1) {
-        char *slash = strrchr(buf, '/');
-        if (!slash) return -1;
-        *slash = 0;
-        size_t n = strlen(buf);
-        if (n >= 4 && strcmp(buf + n - 4, ".app") == 0) {
-            snprintf(out, outlen, "%s", buf);
-            return 0;
-        }
-    }
-}
-
-/* Copy `src_app` to `dst_app`, clear xattrs, strip the existing signature,
- * re-sign ad-hoc without hardened runtime. Returns 0 on success. */
-static int copy_and_unharden(const char *src_app, const char *dst_app,
-                             char *errbuf, size_t errlen) {
-    /* rm -rf dst (in case it exists from a prior run) */
-    char *rm_argv[] = { "rm", "-rf", (char *)dst_app, NULL };
-    if (run("rm", rm_argv) != 0)
-        { snprintf(errbuf, errlen, "rm -rf %s failed", dst_app); return -1; }
-
-    /* cp -R src dst */
-    char *cp_argv[] = { "cp", "-R", (char *)src_app, (char *)dst_app, NULL };
-    if (run("cp", cp_argv) != 0)
-        { snprintf(errbuf, errlen, "cp -R failed"); return -1; }
-
-    /* xattr -cr dst (clear quarantine + other extended attrs) */
-    char *xattr_argv[] = { "xattr", "-cr", (char *)dst_app, NULL };
-    run("xattr", xattr_argv);  /* ignore failure */
-
-    /* codesign --remove-signature dst (may fail if no sig; that's ok) */
-    char *cs_rm_argv[] = { "codesign", "--remove-signature", (char *)dst_app, NULL };
-    run("codesign", cs_rm_argv);
-
-    /* codesign --force --deep --sign - dst (no --options flag; ad-hoc with
-     * --deep gives every nested framework the same empty team id, which
-     * library validation accepts since they match). */
-    char *cs_re_argv[] = { "codesign", "--force", "--deep", "--sign", "-",
-                           (char *)dst_app, NULL };
-    if (run("codesign", cs_re_argv) != 0)
-        { snprintf(errbuf, errlen, "codesign re-sign failed"); return -1; }
-
-    return 0;
-}
+/* find_app_bundle + unharden are now vm_stowaway_find_app_bundle() /
+ * vm_stowaway_unharden() in src/scanner.c. */
 
 static int cmd_wrap(int argc, char **argv) {
     pid_t target_pid = 0;
@@ -865,13 +807,13 @@ static int cmd_wrap(int argc, char **argv) {
 
     if (copy_dest) {
         char src_app[2048];
-        if (find_app_bundle(argv[i], src_app, sizeof(src_app)) < 0)
+        if (vm_stowaway_find_app_bundle(argv[i], src_app, sizeof(src_app)) < 0)
             die("--copy: %s isn't inside a .app bundle", argv[i]);
 
         info("copying %s -> %s and re-signing without hardened runtime",
              src_app, copy_dest);
         char err[256] = {0};
-        if (copy_and_unharden(src_app, copy_dest, err, sizeof(err)) < 0)
+        if (vm_stowaway_unharden(src_app, copy_dest, err, sizeof(err)) < 0)
             die("copy/sign: %s", err);
 
         /* Re-base the exec path inside the copy. */
@@ -924,142 +866,32 @@ static int cmd_attach(int argc, char **argv) {
     return 0;
 }
 
-/* Pipe `codesign -d --entitlements - <path>` and check for flags. Returns 1
- * if both --no-library-validation-friendly bits are set. */
-static int check_entitlements(const char *bin, int *allow_dyld, int *no_libval) {
-    *allow_dyld = 0;
-    *no_libval = 0;
-    /* shell-quote: wrap in single quotes, escape embedded quotes. */
-    char q[2048];
-    size_t qn = 0;
-    q[qn++] = '\'';
-    for (const char *p = bin; *p && qn + 5 < sizeof(q); p++) {
-        if (*p == '\'') { q[qn++]='\''; q[qn++]='\\'; q[qn++]='\''; q[qn++]='\''; }
-        else q[qn++] = *p;
-    }
-    q[qn++] = '\''; q[qn] = 0;
-    char cmd[2200];
-    snprintf(cmd, sizeof(cmd),
-             "codesign -d --entitlements - %s 2>/dev/null", q);
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
-    char buf[8192];
-    size_t got = fread(buf, 1, sizeof(buf) - 1, fp);
-    buf[got] = 0;
-    pclose(fp);
-    if (strstr(buf, "com.apple.security.cs.allow-dyld-environment-variables"))
-        *allow_dyld = 1;
-    if (strstr(buf, "com.apple.security.cs.disable-library-validation"))
-        *no_libval = 1;
-    return 0;
-}
-
-/* Recursively walk /Applications looking for .app bundles, check the main
- * executable's entitlements, print matches. */
-static void scan_apps_at(const char *dir, int depth) {
-    if (depth > 4) return;
-    DIR *d = opendir(dir);
-    if (!d) return;
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        char path[1024];
-        snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-        size_t nlen = strlen(e->d_name);
-        if (nlen > 4 && strcmp(e->d_name + nlen - 4, ".app") == 0) {
-            /* find Contents/MacOS/<exe> */
-            char macos[1280];
-            snprintf(macos, sizeof(macos), "%s/Contents/MacOS", path);
-            DIR *m = opendir(macos);
-            if (!m) continue;
-            struct dirent *me;
-            while ((me = readdir(m))) {
-                if (me->d_name[0] == '.') continue;
-                char exe[2048];
-                snprintf(exe, sizeof(exe), "%s/%s", macos, me->d_name);
-                int ad = 0, nv = 0;
-                if (check_entitlements(exe, &ad, &nv) == 0 && ad && nv) {
-                    printf("%s  (dyld-env + no-libval)\n", path);
-                }
-                break;  /* only check first MacOS binary */
-            }
-            closedir(m);
-        } else {
-            struct stat st;
-            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
-                scan_apps_at(path, depth + 1);
-        }
-    }
-    closedir(d);
-}
-
-/* Look for `Electron Framework.framework` inside an .app to detect Electron.
- * If found, sniff the framework binary for fuse bytes (4-byte sentinel
- * 0x59,0x4D,0x44,0x70 followed by N bool bytes; index 0 = RunAsNode, index 1
- * = CookieEncryption, index 2 = NodeOptions, ... -- we only print RunAsNode). */
-static int is_electron(const char *app, char *fw_out, size_t flen) {
-    char fw[1024];
-    snprintf(fw, sizeof(fw), "%s/Contents/Frameworks/Electron Framework.framework/Electron Framework", app);
-    if (access(fw, F_OK) != 0) return 0;
-    if (fw_out) snprintf(fw_out, flen, "%s", fw);
-    return 1;
-}
-
-static int electron_run_as_node(const char *fw_bin) {
-    /* @electron/fuses v1 sentinel: 32 ASCII bytes, then version u8, then fuse
-     * bytes (0=removed, 1=disabled, 2=enabled). Index 0 = RunAsNode. */
-    static const char SENT[] = "dL7pKGdnNz796PbbjQWNKmHXBZaB9tsX";
-    const size_t slen = sizeof(SENT) - 1;
-    FILE *f = fopen(fw_bin, "rb");
-    if (!f) return -1;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    if (sz <= 0 || sz > (long)(500 * 1024 * 1024)) { fclose(f); return -1; }
-    rewind(f);
-    uint8_t *buf = malloc(sz);
-    if (!buf) { fclose(f); return -1; }
-    long got = (long)fread(buf, 1, sz, f);
-    fclose(f);
-    int result = -1;
-    for (long i = 0; i + (long)slen + 8 <= got; i++) {
-        if (memcmp(buf + i, SENT, slen) == 0) {
-            /* skip version byte (buf[i+slen]) */
-            uint8_t run_as_node = buf[i + slen + 1];
-            result = (run_as_node == 2) ? 1 : 0;
-            break;
-        }
-    }
-    free(buf);
-    return result;
-}
-
 static int cmd_scan_electron(int argc, char **argv) {
     const char *root = argc >= 1 ? argv[0] : "/Applications";
-    DIR *d = opendir(root);
-    if (!d) die("opendir(%s): %s", root, strerror(errno));
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (e->d_name[0] == '.') continue;
-        size_t nlen = strlen(e->d_name);
-        if (nlen < 4 || strcmp(e->d_name + nlen - 4, ".app") != 0) continue;
-        char app[1024];
-        snprintf(app, sizeof(app), "%s/%s", root, e->d_name);
-        char fw[1024];
-        if (!is_electron(app, fw, sizeof(fw))) continue;
-        int ran = electron_run_as_node(fw);
+    char err[256] = {0};
+    vm_stowaway_electron_t buf[256];
+    ssize_t n = vm_stowaway_scan_electron(root, buf, 256, err, sizeof(err));
+    if (n < 0) die("scan-electron: %s", err);
+    for (ssize_t i = 0; i < n && i < 256; i++) {
         printf("%s  electron  RUN_AS_NODE=%s\n",
-               app,
-               ran == 1 ? "enabled" :
-               ran == 0 ? "disabled" : "unknown");
+               buf[i].path,
+               buf[i].run_as_node == 1 ? "enabled" :
+               buf[i].run_as_node == 0 ? "disabled" : "unknown");
     }
-    closedir(d);
+    if (n > 256) info("... (%zd total, showing 256)", n);
     return 0;
 }
 
 static int cmd_scan_targets(int argc, char **argv) {
     const char *root = argc >= 1 ? argv[0] : "/Applications";
     info("scanning %s for hardened-but-permissive apps...", root);
-    scan_apps_at(root, 0);
+    char err[256] = {0};
+    vm_stowaway_app_t buf[256];
+    ssize_t n = vm_stowaway_scan_apps(root, 1, buf, 256, err, sizeof(err));
+    if (n < 0) die("scan-targets: %s", err);
+    for (ssize_t i = 0; i < n && i < 256; i++)
+        printf("%s  (dyld-env + no-libval)\n", buf[i].path);
+    if (n > 256) info("... (%zd total, showing 256)", n);
     return 0;
 }
 
@@ -1132,16 +964,12 @@ static int cmd_hijack(int argc, char **argv) {
     return 0;
 }
 
-/* forward decl */
-static int copy_and_unharden(const char *src_app, const char *dst_app,
-                             char *errbuf, size_t errlen);
-
 static int cmd_unharden(int argc, char **argv) {
     if (argc < 2)
         die("usage: vm_stowaway unharden <src.app> <dst.app>\n"
             "       (copy + ad-hoc resign without hardened runtime / library validation)");
     char err[256] = {0};
-    if (copy_and_unharden(argv[0], argv[1], err, sizeof(err)) < 0)
+    if (vm_stowaway_unharden(argv[0], argv[1], err, sizeof(err)) < 0)
         die("unharden: %s", err);
     ok("%s ready (hardened runtime stripped)", argv[1]);
     return 0;
