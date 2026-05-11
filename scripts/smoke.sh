@@ -40,7 +40,7 @@ chmod +x "$PATCHED"
 "$PATCHED" 15 > "$PATCHED.out" 2>&1 &
 TPID=$!
 disown 2>/dev/null || true
-trap '{ kill $TPID 2>/dev/null; wait $TPID 2>/dev/null; rm -f "$PATCHED" "$PATCHED.out"; } >/dev/null 2>&1' EXIT
+trap '{ kill $TPID 2>/dev/null; wait $TPID 2>/dev/null; rm -f "$PATCHED" "$PATCHED.out"; } >/dev/null 2>&1 || :' EXIT
 sleep 1
 
 ADDR=$("$BUILD/vm_stowaway" resolve $TPID secret 2>/dev/null)
@@ -62,7 +62,7 @@ chmod +x "$PATCHED2"
 "$PATCHED2" 20 > "$PATCHED2.out" 2>&1 &
 T2=$!
 disown 2>/dev/null || true
-trap '{ kill $T2 2>/dev/null; wait $T2 2>/dev/null; rm -f "$PATCHED2" "$PATCHED2.out"; } >/dev/null 2>&1' EXIT
+trap '{ kill $T2 2>/dev/null; wait $T2 2>/dev/null; rm -f "$PATCHED2" "$PATCHED2.out"; } >/dev/null 2>&1 || :' EXIT
 sleep 1
 
 SECRET=$("$BUILD/vm_stowaway" resolve $T2 secret 2>/dev/null)
@@ -94,7 +94,7 @@ chmod +x "$PATCHED3"
 "$PATCHED3" 30 > "$PATCHED3.out" 2>&1 &
 T3=$!
 disown 2>/dev/null || true
-trap '{ kill $T3 2>/dev/null; wait $T3 2>/dev/null; rm -f "$PATCHED3" "$PATCHED3.out"; } >/dev/null 2>&1' EXIT
+trap '{ kill $T3 2>/dev/null; wait $T3 2>/dev/null; rm -f "$PATCHED3" "$PATCHED3.out"; } >/dev/null 2>&1 || :' EXIT
 sleep 1
 
 GETPID=$("$BUILD/vm_stowaway" resolve $T3 libsystem_c.dylib getpid 2>/dev/null)
