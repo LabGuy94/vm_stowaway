@@ -20,8 +20,12 @@
 #include "../include/vm_stowaway.h"
 
 #include <errno.h>
+#include <libproc.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/task_info.h>
+#include <mach/thread_act.h>
+#include <mach/thread_info.h>
 #include <mach/vm_region.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -29,9 +33,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/proc_info.h>
 
 /* Magic value handed back from task_for_pid. */
 #define VMSW_SENTINEL_PORT 0x76737721u  /* 'vsw!' */
+/* Base for fake per-thread sentinel ports. Each thread the tool sees is
+ * VMSW_THREAD_PORT_BASE + index_in_g_thread_tids. */
+#define VMSW_THREAD_PORT_BASE 0x76737800u
+#define VMSW_THREAD_PORT_MAX  256
+
+static int is_thread_sentinel(mach_port_t p) {
+    return p >= VMSW_THREAD_PORT_BASE &&
+           p <  VMSW_THREAD_PORT_BASE + VMSW_THREAD_PORT_MAX;
+}
 
 static int             g_target_pid = -1;
 static vm_stowaway_t  *g_handle = NULL;
@@ -41,6 +55,12 @@ static pthread_mutex_t g_handle_mu = PTHREAD_MUTEX_INITIALIZER;
 static vm_stowaway_region_t *g_regions = NULL;
 static ssize_t               g_n_regions = 0;
 static pthread_mutex_t       g_regions_mu = PTHREAD_MUTEX_INITIALIZER;
+
+/* Most recent thread enumeration: maps the fake port (BASE+i) back to the
+ * tid the payload reported. Mutated under g_threads_mu. */
+static uint64_t        g_thread_tids[VMSW_THREAD_PORT_MAX];
+static uint32_t        g_thread_count = 0;
+static pthread_mutex_t g_threads_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void log_msg(const char *fmt, ...) {
     if (!getenv("VM_STOWAWAY_DEBUG")) return;
@@ -238,7 +258,8 @@ static kern_return_t vmsw_mach_vm_region_recurse(vm_map_read_t task,
 
 static kern_return_t vmsw_mach_port_deallocate(ipc_space_t task,
                                                mach_port_name_t name) {
-    if (name == VMSW_SENTINEL_PORT) return KERN_SUCCESS;
+    if (name == VMSW_SENTINEL_PORT || is_thread_sentinel(name))
+        return KERN_SUCCESS;
     return mach_port_deallocate(task, name);
 }
 
@@ -246,7 +267,8 @@ static kern_return_t vmsw_mach_port_mod_refs(ipc_space_t task,
                                              mach_port_name_t name,
                                              mach_port_right_t right,
                                              mach_port_delta_t delta) {
-    if (name == VMSW_SENTINEL_PORT) return KERN_SUCCESS;
+    if (name == VMSW_SENTINEL_PORT || is_thread_sentinel(name))
+        return KERN_SUCCESS;
     return mach_port_mod_refs(task, name, right, delta);
 }
 
@@ -268,18 +290,52 @@ static kern_return_t vmsw_task_resume(task_t task) {
     return task_resume(task);
 }
 
-/* task_info: zero-fill the requested struct and return success. Tools use
- * a variety of flavors (TASK_BASIC_INFO_64 for cpu/mem, TASK_DYLD_INFO for
- * the dyld_all_image_infos pointer, ...). Returning all-zeros is enough to
- * get past tools that only check kern_return; tools that depend on the
- * specific fields will need a richer impl (planned). */
+/* task_info: real implementations for TASK_DYLD_INFO (routed to payload)
+ * and TASK_BASIC_INFO_64 (filled from proc_pidinfo locally, no entitlement
+ * needed). Other flavors get zero-fill + success. */
 static kern_return_t vmsw_task_info(task_name_t task,
                                     task_flavor_t flavor,
                                     task_info_t info,
                                     mach_msg_type_number_t *count) {
     if (task == VMSW_SENTINEL_PORT) {
-        log_msg("task_info(sentinel, flavor=%u, count=%u) -> zero-filled",
-                flavor, count ? *count : 0);
+        if (flavor == TASK_DYLD_INFO && info && count &&
+            *count >= TASK_DYLD_INFO_COUNT) {
+            vm_stowaway_t *h = handle();
+            if (!h) return KERN_FAILURE;
+            struct task_dyld_info di = {0};
+            uint32_t fmt = 0;
+            if (vm_stowaway_dyld_info(h, &di.all_image_info_addr,
+                                       &di.all_image_info_size, &fmt) < 0)
+                return KERN_FAILURE;
+            di.all_image_info_format = fmt;
+            memcpy(info, &di, sizeof(di));
+            *count = TASK_DYLD_INFO_COUNT;
+            log_msg("task_info(sentinel, TASK_DYLD_INFO) -> addr=0x%llx",
+                    (unsigned long long)di.all_image_info_addr);
+            return KERN_SUCCESS;
+        }
+        if (flavor == TASK_BASIC_INFO_64 && info && count &&
+            *count >= TASK_BASIC_INFO_64_COUNT) {
+            struct proc_taskinfo pti = {0};
+            int n = proc_pidinfo(g_target_pid, PROC_PIDTASKINFO, 0,
+                                 &pti, sizeof(pti));
+            task_basic_info_64_data_t bi = {0};
+            if (n == (int)sizeof(pti)) {
+                bi.virtual_size  = pti.pti_virtual_size;
+                bi.resident_size = pti.pti_resident_size;
+                bi.user_time.seconds      = (int)(pti.pti_total_user / 1000000000ULL);
+                bi.user_time.microseconds = (int)((pti.pti_total_user / 1000ULL) % 1000000ULL);
+                bi.system_time.seconds      = (int)(pti.pti_total_system / 1000000000ULL);
+                bi.system_time.microseconds = (int)((pti.pti_total_system / 1000ULL) % 1000000ULL);
+            }
+            memcpy(info, &bi, sizeof(bi));
+            *count = TASK_BASIC_INFO_64_COUNT;
+            log_msg("task_info(sentinel, TASK_BASIC_INFO_64) -> vsz=%llu rsz=%llu",
+                    (unsigned long long)bi.virtual_size,
+                    (unsigned long long)bi.resident_size);
+            return KERN_SUCCESS;
+        }
+        log_msg("task_info(sentinel, flavor=%u) -> zero-filled fallback", flavor);
         if (info && count && *count > 0)
             memset(info, 0, (size_t)(*count) * sizeof(integer_t));
         return KERN_SUCCESS;
@@ -287,16 +343,85 @@ static kern_return_t vmsw_task_info(task_name_t task,
     return task_info(task, flavor, info, count);
 }
 
+/* task_threads: ask the payload for tids, store them in g_thread_tids, hand
+ * back fake per-thread sentinel ports indexed off VMSW_THREAD_PORT_BASE. */
 static kern_return_t vmsw_task_threads(task_inspect_t task,
-                                       thread_act_array_t *threads,
-                                       mach_msg_type_number_t *count) {
+                                       thread_act_array_t *threads_out,
+                                       mach_msg_type_number_t *count_out) {
     if (task == VMSW_SENTINEL_PORT) {
-        log_msg("task_threads(sentinel) -> empty list");
-        if (threads) *threads = NULL;
-        if (count) *count = 0;
+        vm_stowaway_t *h = handle();
+        if (!h) return KERN_FAILURE;
+        uint64_t tids[VMSW_THREAD_PORT_MAX];
+        ssize_t n = vm_stowaway_threads(h, tids, VMSW_THREAD_PORT_MAX);
+        if (n < 0) return KERN_FAILURE;
+        if (n > VMSW_THREAD_PORT_MAX) n = VMSW_THREAD_PORT_MAX;
+
+        pthread_mutex_lock(&g_threads_mu);
+        g_thread_count = (uint32_t)n;
+        for (ssize_t i = 0; i < n; i++) g_thread_tids[i] = tids[i];
+        pthread_mutex_unlock(&g_threads_mu);
+
+        /* The caller will mach_vm_deallocate this array (with self_task,
+         * which falls through to the real call), so back it with real
+         * mach-allocated memory. */
+        mach_vm_address_t addr = 0;
+        mach_vm_size_t bytes = (mach_vm_size_t)n * sizeof(thread_act_t);
+        kern_return_t kr = mach_vm_allocate(mach_task_self(), &addr, bytes,
+                                            VM_FLAGS_ANYWHERE);
+        if (kr != KERN_SUCCESS) return kr;
+        thread_act_t *arr = (thread_act_t *)(uintptr_t)addr;
+        for (ssize_t i = 0; i < n; i++)
+            arr[i] = VMSW_THREAD_PORT_BASE + (uint32_t)i;
+        *threads_out = arr;
+        *count_out = (mach_msg_type_number_t)n;
+        log_msg("task_threads(sentinel) -> %zd threads", n);
         return KERN_SUCCESS;
     }
-    return task_threads(task, threads, count);
+    return task_threads(task, threads_out, count_out);
+}
+
+static kern_return_t vmsw_thread_get_state(thread_act_t thread,
+                                           thread_state_flavor_t flavor,
+                                           thread_state_t state,
+                                           mach_msg_type_number_t *count) {
+    if (is_thread_sentinel(thread)) {
+        uint32_t idx = thread - VMSW_THREAD_PORT_BASE;
+        pthread_mutex_lock(&g_threads_mu);
+        uint64_t tid = (idx < g_thread_count) ? g_thread_tids[idx] : 0;
+        pthread_mutex_unlock(&g_threads_mu);
+        if (!tid) return KERN_INVALID_ARGUMENT;
+        vm_stowaway_t *h = handle();
+        if (!h) return KERN_FAILURE;
+        uint32_t c = *count;
+        if (vm_stowaway_thread_get_state(h, tid, (uint32_t)flavor, &c,
+                                         state, (*count) * sizeof(uint32_t)) < 0)
+            return KERN_FAILURE;
+        *count = c;
+        log_msg("thread_get_state(tid=%llu, flavor=%u) -> %u natural_t",
+                (unsigned long long)tid, flavor, c);
+        return KERN_SUCCESS;
+    }
+    return thread_get_state(thread, flavor, state, count);
+}
+
+static kern_return_t vmsw_thread_set_state(thread_act_t thread,
+                                           thread_state_flavor_t flavor,
+                                           thread_state_t state,
+                                           mach_msg_type_number_t count) {
+    if (is_thread_sentinel(thread)) {
+        uint32_t idx = thread - VMSW_THREAD_PORT_BASE;
+        pthread_mutex_lock(&g_threads_mu);
+        uint64_t tid = (idx < g_thread_count) ? g_thread_tids[idx] : 0;
+        pthread_mutex_unlock(&g_threads_mu);
+        if (!tid) return KERN_INVALID_ARGUMENT;
+        vm_stowaway_t *h = handle();
+        if (!h) return KERN_FAILURE;
+        if (vm_stowaway_thread_set_state(h, tid, (uint32_t)flavor, count, state) < 0)
+            return KERN_FAILURE;
+        log_msg("thread_set_state(tid=%llu, flavor=%u)", (unsigned long long)tid, flavor);
+        return KERN_SUCCESS;
+    }
+    return thread_set_state(thread, flavor, state, count);
 }
 
 /* --- VM allocation / protection (sentinel path) --- */
@@ -306,9 +431,13 @@ static kern_return_t vmsw_mach_vm_allocate(vm_map_t task,
                                            mach_vm_size_t size,
                                            int flags) {
     if (task == VMSW_SENTINEL_PORT) {
-        log_msg("mach_vm_allocate(sentinel, size=%llu) -> KERN_FAILURE "
-                "(allocation in target not supported by v1 shim)", size);
-        return KERN_FAILURE;
+        vm_stowaway_t *h = handle();
+        if (!h) return KERN_FAILURE;
+        uint64_t a = vm_stowaway_allocate(h, size, flags);
+        if (!a) return KERN_FAILURE;
+        *addr = (mach_vm_address_t)a;
+        log_msg("mach_vm_allocate(sentinel, size=%llu) -> 0x%llx", size, a);
+        return KERN_SUCCESS;
     }
     return mach_vm_allocate(task, addr, size, flags);
 }
@@ -317,7 +446,9 @@ static kern_return_t vmsw_mach_vm_deallocate(vm_map_t task,
                                              mach_vm_address_t addr,
                                              mach_vm_size_t size) {
     if (task == VMSW_SENTINEL_PORT) {
-        log_msg("mach_vm_deallocate(sentinel) -> ok (no-op)");
+        vm_stowaway_t *h = handle();
+        if (h) vm_stowaway_deallocate(h, addr, size);
+        log_msg("mach_vm_deallocate(sentinel, 0x%llx, %llu)", addr, size);
         return KERN_SUCCESS;
     }
     return mach_vm_deallocate(task, addr, size);
@@ -363,6 +494,8 @@ DYLD_INTERPOSE(vmsw_task_suspend,            task_suspend);
 DYLD_INTERPOSE(vmsw_task_resume,             task_resume);
 DYLD_INTERPOSE(vmsw_task_info,               task_info);
 DYLD_INTERPOSE(vmsw_task_threads,            task_threads);
+DYLD_INTERPOSE(vmsw_thread_get_state,        thread_get_state);
+DYLD_INTERPOSE(vmsw_thread_set_state,        thread_set_state);
 DYLD_INTERPOSE(vmsw_mach_vm_allocate,        mach_vm_allocate);
 DYLD_INTERPOSE(vmsw_mach_vm_deallocate,      mach_vm_deallocate);
 DYLD_INTERPOSE(vmsw_mach_vm_protect,         mach_vm_protect);

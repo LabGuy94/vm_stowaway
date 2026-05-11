@@ -108,9 +108,17 @@ OUT=$("$BUILD/vm_stowaway" wrap --pid $T2 -- \
     "$BUILD/examples/mach_client" $T2 $SECRET 4 "39050000" 2>&1)
 echo "$OUT" | sed 's/^/    /'
 sleep 2
-if grep -q "secret=1337" "$PATCHED2.out" && \
-   echo "$OUT" | grep -q "wrote 4 bytes" && \
-   echo "$OUT" | grep -q "region:"; then
+
+fail=0
+grep -q "secret=1337" "$PATCHED2.out" || { echo "    target never observed write"; fail=1; }
+echo "$OUT" | grep -q "wrote 4 bytes"             || { echo "    no write ack";        fail=1; }
+echo "$OUT" | grep -q "^region:"                  || { echo "    no region walked";    fail=1; }
+echo "$OUT" | grep -q "dyld_all_image_infos @ 0x" || { echo "    no TASK_DYLD_INFO";   fail=1; }
+echo "$OUT" | grep -q "task_basic_info: vsz="     || { echo "    no TASK_BASIC_INFO";  fail=1; }
+echo "$OUT" | grep -q "^task_threads: "           || { echo "    no task_threads";     fail=1; }
+echo "$OUT" | grep -q " pc=0x"                    || { echo "    no thread_get_state"; fail=1; }
+echo "$OUT" | grep -q 'alloc/rt:.*round-trip'     || { echo "    no alloc round-trip"; fail=1; }
+if [[ $fail -eq 0 ]]; then
     echo -e "${CHECK} mach API shim ok"
 else
     echo -e "${CROSS} mach API shim path failed"

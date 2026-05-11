@@ -151,6 +151,40 @@ ssize_t vm_stowaway_scan(vm_stowaway_t *h,
                          size_t pat_len,
                          uint64_t *out, size_t max_hits);
 
+/* -- task / thread / allocation ----------------------------------------- */
+
+/* Fetch the target's task_dyld_info (address + size + format of the
+ * dyld_all_image_infos struct in the target's address space). */
+int vm_stowaway_dyld_info(vm_stowaway_t *h,
+                          uint64_t *all_image_info_addr,
+                          uint64_t *all_image_info_size,
+                          uint32_t *all_image_info_format);
+
+/* List thread IDs in the target. Writes up to `max` ids; returns total. */
+ssize_t vm_stowaway_threads(vm_stowaway_t *h,
+                            uint64_t *tids_out, size_t max);
+
+/* Get a thread's register state. `flavor` is a Mach thread_state_flavor_t
+ * (e.g. ARM_THREAD_STATE64). On entry *count is the number of natural_t
+ * (uint32_t) units the caller can accept; on exit it's how many were
+ * written. Returns 0 on success, -1 on error. */
+int vm_stowaway_thread_get_state(vm_stowaway_t *h,
+                                 uint64_t tid, uint32_t flavor,
+                                 uint32_t *count, void *state_out,
+                                 size_t state_capacity);
+
+/* Set a thread's register state. */
+int vm_stowaway_thread_set_state(vm_stowaway_t *h,
+                                 uint64_t tid, uint32_t flavor,
+                                 uint32_t count, const void *state);
+
+/* Allocate `size` bytes inside the target. Returns the address, or 0 on
+ * failure. `flags` is VM_FLAGS_ANYWHERE etc. */
+uint64_t vm_stowaway_allocate(vm_stowaway_t *h, uint64_t size, int flags);
+
+/* Free memory previously allocated in the target. */
+int vm_stowaway_deallocate(vm_stowaway_t *h, uint64_t addr, uint64_t size);
+
 /* -- diagnostics -------------------------------------------------------- */
 
 const char *vm_stowaway_last_error(const vm_stowaway_t *h);

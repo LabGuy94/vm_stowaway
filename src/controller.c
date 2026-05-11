@@ -435,6 +435,90 @@ ssize_t vm_stowaway_regions(vm_stowaway_t *h, vm_stowaway_region_t *out, size_t 
     return (ssize_t)n;
 }
 
+int vm_stowaway_dyld_info(vm_stowaway_t *h, uint64_t *addr, uint64_t *size,
+                          uint32_t *format) {
+    uint8_t *body = NULL; size_t body_len = 0;
+    if (rpc_or_err(h, VMSW_OP_DYLD_INFO, NULL, 0, &body, &body_len) < 0)
+        return -1;
+    if (body_len < sizeof(struct vmsw_dyld_info_resp)) {
+        free(body); set_err(h, "short dyld_info response"); return -1;
+    }
+    struct vmsw_dyld_info_resp r;
+    memcpy(&r, body, sizeof(r));
+    if (addr) *addr = r.all_image_info_addr;
+    if (size) *size = r.all_image_info_size;
+    if (format) *format = r.all_image_info_format;
+    free(body);
+    return 0;
+}
+
+ssize_t vm_stowaway_threads(vm_stowaway_t *h, uint64_t *tids_out, size_t max) {
+    uint8_t *body = NULL; size_t body_len = 0;
+    if (rpc_or_err(h, VMSW_OP_THREADS, NULL, 0, &body, &body_len) < 0)
+        return -1;
+    size_t n = body_len / sizeof(struct vmsw_thread_entry);
+    for (size_t i = 0; i < n && i < max; i++) {
+        struct vmsw_thread_entry e;
+        memcpy(&e, body + i * sizeof(e), sizeof(e));
+        tids_out[i] = e.tid;
+    }
+    free(body);
+    return (ssize_t)n;
+}
+
+int vm_stowaway_thread_get_state(vm_stowaway_t *h, uint64_t tid, uint32_t flavor,
+                                 uint32_t *count, void *state_out,
+                                 size_t state_capacity) {
+    if (!count) { set_err(h, "null count"); return -1; }
+    struct vmsw_thread_state_req req = { .tid = tid, .flavor = flavor, .count = *count };
+    uint8_t *body = NULL; size_t body_len = 0;
+    if (rpc_or_err(h, VMSW_OP_THREAD_GET_STATE, &req, sizeof(req),
+                   &body, &body_len) < 0)
+        return -1;
+    size_t copy = body_len < state_capacity ? body_len : state_capacity;
+    if (state_out) memcpy(state_out, body, copy);
+    *count = (uint32_t)(body_len / sizeof(uint32_t));
+    free(body);
+    return 0;
+}
+
+int vm_stowaway_thread_set_state(vm_stowaway_t *h, uint64_t tid, uint32_t flavor,
+                                 uint32_t count, const void *state) {
+    size_t total = sizeof(struct vmsw_thread_state_set_req) + count * sizeof(uint32_t);
+    uint8_t *msg = malloc(total);
+    if (!msg) { set_err(h, "oom"); return -1; }
+    struct vmsw_thread_state_set_req req = { .tid = tid, .flavor = flavor, .count = count };
+    memcpy(msg, &req, sizeof(req));
+    if (count && state) memcpy(msg + sizeof(req), state, count * sizeof(uint32_t));
+    uint8_t *body = NULL; size_t body_len = 0;
+    int rc = rpc_or_err(h, VMSW_OP_THREAD_SET_STATE, msg, total, &body, &body_len);
+    free(msg); free(body);
+    return rc;
+}
+
+uint64_t vm_stowaway_allocate(vm_stowaway_t *h, uint64_t size, int flags) {
+    struct vmsw_alloc_req req = { .size = size, .flags = flags };
+    uint8_t *body = NULL; size_t body_len = 0;
+    if (rpc_or_err(h, VMSW_OP_ALLOCATE, &req, sizeof(req), &body, &body_len) < 0)
+        return 0;
+    uint64_t addr = 0;
+    if (body_len >= sizeof(struct vmsw_alloc_resp)) {
+        struct vmsw_alloc_resp r;
+        memcpy(&r, body, sizeof(r));
+        addr = r.addr;
+    }
+    free(body);
+    return addr;
+}
+
+int vm_stowaway_deallocate(vm_stowaway_t *h, uint64_t addr, uint64_t size) {
+    struct vmsw_dealloc_req req = { .addr = addr, .size = size };
+    uint8_t *body = NULL; size_t body_len = 0;
+    int rc = rpc_or_err(h, VMSW_OP_DEALLOCATE, &req, sizeof(req), &body, &body_len);
+    free(body);
+    return rc;
+}
+
 ssize_t vm_stowaway_scan(vm_stowaway_t *h,
                          uint64_t start, uint64_t end,
                          const uint8_t *pattern, const uint8_t *mask,

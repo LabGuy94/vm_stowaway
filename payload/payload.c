@@ -16,6 +16,9 @@
 #include <mach-o/loader.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/task_info.h>
+#include <mach/thread_act.h>
+#include <mach/thread_info.h>
 #include <mach/vm_region.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -344,6 +347,159 @@ static int op_scan(int fd, uint32_t seq, const uint8_t *body, uint64_t body_len)
     return rc;
 }
 
+static int op_dyld_info(int fd, uint32_t seq) {
+    struct task_dyld_info info;
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    kern_return_t kr = task_info(mach_task_self(), TASK_DYLD_INFO,
+                                 (task_info_t)&info, &count);
+    if (kr != KERN_SUCCESS)
+        return send_error(fd, VMSW_ERR_INTERNAL, seq, mach_error_string(kr));
+    struct vmsw_dyld_info_resp r = {
+        .all_image_info_addr = info.all_image_info_addr,
+        .all_image_info_size = info.all_image_info_size,
+        .all_image_info_format = (uint32_t)info.all_image_info_format,
+        ._pad = 0,
+    };
+    return send_response(fd, VMSW_OK, seq, &r, sizeof(r));
+}
+
+static int op_threads(int fd, uint32_t seq) {
+    thread_act_array_t threads;
+    mach_msg_type_number_t n = 0;
+    kern_return_t kr = task_threads(mach_task_self(), &threads, &n);
+    if (kr != KERN_SUCCESS)
+        return send_error(fd, VMSW_ERR_INTERNAL, seq, mach_error_string(kr));
+
+    struct vmsw_thread_entry *entries = calloc(n, sizeof(*entries));
+    if (!entries) {
+        for (uint32_t i = 0; i < n; i++)
+            mach_port_deallocate(mach_task_self(), threads[i]);
+        vm_deallocate(mach_task_self(), (vm_address_t)threads,
+                      n * sizeof(thread_act_t));
+        return send_error(fd, VMSW_ERR_INTERNAL, seq, "oom");
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        thread_identifier_info_data_t ti;
+        mach_msg_type_number_t tc = THREAD_IDENTIFIER_INFO_COUNT;
+        if (thread_info(threads[i], THREAD_IDENTIFIER_INFO,
+                        (thread_info_t)&ti, &tc) == KERN_SUCCESS)
+            entries[i].tid = ti.thread_id;
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads,
+                  n * sizeof(thread_act_t));
+
+    int rc = send_response(fd, VMSW_OK, seq, entries, n * sizeof(*entries));
+    free(entries);
+    return rc;
+}
+
+/* Find the thread by BSD thread id. Returns a send right that the caller
+ * must mach_port_deallocate. Returns 0 if not found. */
+static thread_act_t thread_by_tid(uint64_t tid) {
+    thread_act_array_t threads;
+    mach_msg_type_number_t n = 0;
+    if (task_threads(mach_task_self(), &threads, &n) != KERN_SUCCESS) return 0;
+    thread_act_t found = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (!found) {
+            thread_identifier_info_data_t ti;
+            mach_msg_type_number_t tc = THREAD_IDENTIFIER_INFO_COUNT;
+            if (thread_info(threads[i], THREAD_IDENTIFIER_INFO,
+                            (thread_info_t)&ti, &tc) == KERN_SUCCESS &&
+                ti.thread_id == tid) {
+                found = threads[i];
+                continue;
+            }
+        }
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)threads,
+                  n * sizeof(thread_act_t));
+    return found;
+}
+
+static int op_thread_get_state(int fd, uint32_t seq,
+                               const uint8_t *body, uint64_t body_len) {
+    if (body_len < sizeof(struct vmsw_thread_state_req))
+        return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "short");
+    struct vmsw_thread_state_req req;
+    memcpy(&req, body, sizeof(req));
+    if (req.count == 0 || req.count > 1024)
+        return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "bad count");
+
+    thread_act_t th = thread_by_tid(req.tid);
+    if (!th)
+        return send_error(fd, VMSW_ERR_NOT_FOUND, seq, "thread not found");
+
+    natural_t *state = calloc(req.count, sizeof(natural_t));
+    if (!state) {
+        mach_port_deallocate(mach_task_self(), th);
+        return send_error(fd, VMSW_ERR_INTERNAL, seq, "oom");
+    }
+    mach_msg_type_number_t cnt = req.count;
+    kern_return_t kr = thread_get_state(th, req.flavor, state, &cnt);
+    mach_port_deallocate(mach_task_self(), th);
+    if (kr != KERN_SUCCESS) {
+        free(state);
+        return send_error(fd, VMSW_ERR_INTERNAL, seq, mach_error_string(kr));
+    }
+    int rc = send_response(fd, VMSW_OK, seq, state, cnt * sizeof(natural_t));
+    free(state);
+    return rc;
+}
+
+static int op_thread_set_state(int fd, uint32_t seq,
+                               const uint8_t *body, uint64_t body_len) {
+    if (body_len < sizeof(struct vmsw_thread_state_set_req))
+        return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "short");
+    struct vmsw_thread_state_set_req req;
+    memcpy(&req, body, sizeof(req));
+    if (body_len < sizeof(req) + req.count * sizeof(natural_t))
+        return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "truncated");
+
+    thread_act_t th = thread_by_tid(req.tid);
+    if (!th)
+        return send_error(fd, VMSW_ERR_NOT_FOUND, seq, "thread not found");
+
+    kern_return_t kr = thread_set_state(th, req.flavor,
+                                        (thread_state_t)(body + sizeof(req)),
+                                        req.count);
+    mach_port_deallocate(mach_task_self(), th);
+    if (kr != KERN_SUCCESS)
+        return send_error(fd, VMSW_ERR_INTERNAL, seq, mach_error_string(kr));
+    return send_response(fd, VMSW_OK, seq, NULL, 0);
+}
+
+static int op_allocate(int fd, uint32_t seq,
+                       const uint8_t *body, uint64_t body_len) {
+    if (body_len < sizeof(struct vmsw_alloc_req))
+        return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "short");
+    struct vmsw_alloc_req req;
+    memcpy(&req, body, sizeof(req));
+    mach_vm_address_t addr = 0;
+    kern_return_t kr = mach_vm_allocate(mach_task_self(), &addr,
+                                        (mach_vm_size_t)req.size, req.flags);
+    if (kr != KERN_SUCCESS)
+        return send_error(fd, VMSW_ERR_INTERNAL, seq, mach_error_string(kr));
+    struct vmsw_alloc_resp r = { .addr = addr };
+    return send_response(fd, VMSW_OK, seq, &r, sizeof(r));
+}
+
+static int op_deallocate(int fd, uint32_t seq,
+                         const uint8_t *body, uint64_t body_len) {
+    if (body_len < sizeof(struct vmsw_dealloc_req))
+        return send_error(fd, VMSW_ERR_BAD_REQUEST, seq, "short");
+    struct vmsw_dealloc_req req;
+    memcpy(&req, body, sizeof(req));
+    kern_return_t kr = mach_vm_deallocate(mach_task_self(),
+                                          (mach_vm_address_t)req.addr,
+                                          (mach_vm_size_t)req.size);
+    if (kr != KERN_SUCCESS)
+        return send_error(fd, VMSW_ERR_INTERNAL, seq, mach_error_string(kr));
+    return send_response(fd, VMSW_OK, seq, NULL, 0);
+}
+
 /* -- session loop ---------------------------------------------------------- */
 
 static int serve_one(int cfd) {
@@ -367,14 +523,20 @@ static int serve_one(int cfd) {
 
         int rc = 0;
         switch (h.op_or_status) {
-        case VMSW_OP_PING:    rc = op_ping(cfd, h.seq); break;
-        case VMSW_OP_READ:    rc = op_read(cfd, h.seq, body, h.payload_len); break;
-        case VMSW_OP_WRITE:   rc = op_write(cfd, h.seq, body, h.payload_len); break;
-        case VMSW_OP_RESOLVE: rc = op_resolve(cfd, h.seq, body, h.payload_len); break;
-        case VMSW_OP_IMAGES:  rc = op_images(cfd, h.seq); break;
-        case VMSW_OP_REGIONS: rc = op_regions(cfd, h.seq); break;
-        case VMSW_OP_SCAN:    rc = op_scan(cfd, h.seq, body, h.payload_len); break;
-        case VMSW_OP_QUIT:    free(body); return 1;
+        case VMSW_OP_PING:             rc = op_ping(cfd, h.seq); break;
+        case VMSW_OP_READ:             rc = op_read(cfd, h.seq, body, h.payload_len); break;
+        case VMSW_OP_WRITE:            rc = op_write(cfd, h.seq, body, h.payload_len); break;
+        case VMSW_OP_RESOLVE:          rc = op_resolve(cfd, h.seq, body, h.payload_len); break;
+        case VMSW_OP_IMAGES:           rc = op_images(cfd, h.seq); break;
+        case VMSW_OP_REGIONS:          rc = op_regions(cfd, h.seq); break;
+        case VMSW_OP_SCAN:             rc = op_scan(cfd, h.seq, body, h.payload_len); break;
+        case VMSW_OP_DYLD_INFO:        rc = op_dyld_info(cfd, h.seq); break;
+        case VMSW_OP_THREADS:          rc = op_threads(cfd, h.seq); break;
+        case VMSW_OP_THREAD_GET_STATE: rc = op_thread_get_state(cfd, h.seq, body, h.payload_len); break;
+        case VMSW_OP_THREAD_SET_STATE: rc = op_thread_set_state(cfd, h.seq, body, h.payload_len); break;
+        case VMSW_OP_ALLOCATE:         rc = op_allocate(cfd, h.seq, body, h.payload_len); break;
+        case VMSW_OP_DEALLOCATE:       rc = op_deallocate(cfd, h.seq, body, h.payload_len); break;
+        case VMSW_OP_QUIT:             free(body); return 1;
         default:
             rc = send_error(cfd, VMSW_ERR_BAD_OP, h.seq, "unknown op");
         }
