@@ -9,13 +9,15 @@ two ways to get the payload in:
 
 there's also a `DYLD_INTERPOSE` shim so existing memory tools (anything calling `task_for_pid` + the `mach_vm_*` family) work without SIP off / debug entitlements. wrap the tool with `vm_stowaway wrap` and its mach calls get routed to the payload sitting inside the target
 
-## build
+## install
 
 ```
-make
+curl -fsSL https://raw.githubusercontent.com/LabGuy94/vm_stowaway/master/install.sh | bash
 ```
 
-macOS 11+, universal (arm64 + x86_64)
+builds from source and installs to `/usr/local` (will `sudo` if needed). macOS 11+, universal (arm64 + x86_64). xcode CLI tools required (`xcode-select --install`)
+
+or from source: `git clone https://github.com/LabGuy94/vm_stowaway && cd vm_stowaway && make && sudo make install`
 
 ## usage
 

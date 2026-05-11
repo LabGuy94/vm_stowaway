@@ -104,7 +104,8 @@ $(BUILD)/examples/mach_client: examples/mach_client.c
 install: all
 	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include \
 	           $(DESTDIR)$(PREFIX)/bin
-	install -m 0644 $(LIB_STATIC) $(LIB_DYNAMIC) $(PAYLOAD_LIB) $(DESTDIR)$(PREFIX)/lib/
+	install -m 0644 $(LIB_STATIC) $(LIB_DYNAMIC) $(PAYLOAD_LIB) $(SHIM_LIB) \
+	    $(DESTDIR)$(PREFIX)/lib/
 	install -m 0644 include/$(NAME).h $(DESTDIR)$(PREFIX)/include/
 	install -m 0755 $(CLI_BIN) $(DESTDIR)$(PREFIX)/bin/
 
