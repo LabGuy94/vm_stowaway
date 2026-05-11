@@ -470,6 +470,160 @@ static kern_return_t vmsw_mach_vm_protect(vm_map_t task,
     return mach_vm_protect(task, addr, size, set_max, new_prot);
 }
 
+/* -- additional task / thread / port APIs -------------------------------- */
+
+static kern_return_t vmsw_pid_for_task(mach_port_name_t task, int *pid) {
+    if (task == VMSW_SENTINEL_PORT) {
+        if (pid) *pid = g_target_pid;
+        log_msg("pid_for_task(sentinel) -> %d", g_target_pid);
+        return KERN_SUCCESS;
+    }
+    return pid_for_task(task, pid);
+}
+
+static kern_return_t vmsw_task_set_info(task_t task, task_flavor_t flavor,
+                                        task_info_t info,
+                                        mach_msg_type_number_t cnt) {
+    if (task == VMSW_SENTINEL_PORT) {
+        log_msg("task_set_info(sentinel, flavor=%u) -> ok (no-op)", flavor);
+        return KERN_SUCCESS;
+    }
+    return task_set_info(task, flavor, info, cnt);
+}
+
+static kern_return_t vmsw_task_terminate(task_t task) {
+    if (task == VMSW_SENTINEL_PORT) {
+        /* Refuse to kill the target by accident. */
+        log_msg("task_terminate(sentinel) -> ok (refused)");
+        return KERN_SUCCESS;
+    }
+    return task_terminate(task);
+}
+
+static kern_return_t vmsw_task_set_exception_ports(task_t task,
+                                                   exception_mask_t mask,
+                                                   mach_port_t handler,
+                                                   exception_behavior_t behavior,
+                                                   thread_state_flavor_t flavor) {
+    if (task == VMSW_SENTINEL_PORT) {
+        log_msg("task_set_exception_ports(sentinel) -> ok (no-op)");
+        return KERN_SUCCESS;
+    }
+    return task_set_exception_ports(task, mask, handler, behavior, flavor);
+}
+
+static kern_return_t vmsw_task_get_exception_ports(task_t task,
+                                                   exception_mask_t mask,
+                                                   exception_mask_array_t masks,
+                                                   mach_msg_type_number_t *cnt,
+                                                   exception_handler_array_t ports,
+                                                   exception_behavior_array_t behaviors,
+                                                   exception_flavor_array_t flavors) {
+    if (task == VMSW_SENTINEL_PORT) {
+        if (cnt) *cnt = 0;
+        log_msg("task_get_exception_ports(sentinel) -> 0 ports");
+        return KERN_SUCCESS;
+    }
+    return task_get_exception_ports(task, mask, masks, cnt, ports, behaviors, flavors);
+}
+
+static kern_return_t vmsw_thread_info(thread_inspect_t thread,
+                                      thread_flavor_t flavor,
+                                      thread_info_t info,
+                                      mach_msg_type_number_t *count) {
+    if (is_thread_sentinel(thread)) {
+        if (info && count && *count > 0)
+            memset(info, 0, (size_t)(*count) * sizeof(natural_t));
+        log_msg("thread_info(sentinel_thread, flavor=%u) -> zero-filled", flavor);
+        return KERN_SUCCESS;
+    }
+    return thread_info(thread, flavor, info, count);
+}
+
+static kern_return_t vmsw_thread_suspend(thread_act_t thread) {
+    if (is_thread_sentinel(thread)) return KERN_SUCCESS;
+    return thread_suspend(thread);
+}
+
+static kern_return_t vmsw_thread_resume(thread_act_t thread) {
+    if (is_thread_sentinel(thread)) return KERN_SUCCESS;
+    return thread_resume(thread);
+}
+
+static kern_return_t vmsw_thread_terminate(thread_act_t thread) {
+    if (is_thread_sentinel(thread)) {
+        log_msg("thread_terminate(sentinel_thread) -> ok (refused)");
+        return KERN_SUCCESS;
+    }
+    return thread_terminate(thread);
+}
+
+static kern_return_t vmsw_mach_port_destroy(ipc_space_t task,
+                                            mach_port_name_t name) {
+    if (name == VMSW_SENTINEL_PORT || is_thread_sentinel(name))
+        return KERN_SUCCESS;
+    return mach_port_destroy(task, name);
+}
+
+/* --- legacy vm_* family (32-bit-named variants of mach_vm_*) --- */
+
+static kern_return_t vmsw_vm_read(vm_map_t task, vm_address_t addr,
+                                  vm_size_t size, vm_offset_t *data,
+                                  mach_msg_type_number_t *cnt) {
+    if (task == VMSW_SENTINEL_PORT)
+        return vmsw_mach_vm_read(task, addr, size, data, cnt);
+    return vm_read(task, addr, size, data, cnt);
+}
+
+static kern_return_t vmsw_vm_read_overwrite(vm_map_t task, vm_address_t addr,
+                                            vm_size_t size, vm_address_t data,
+                                            vm_size_t *out_size) {
+    if (task == VMSW_SENTINEL_PORT) {
+        mach_vm_size_t got = 0;
+        kern_return_t kr = vmsw_mach_vm_read_overwrite(task, addr, size, data, &got);
+        if (out_size) *out_size = (vm_size_t)got;
+        return kr;
+    }
+    return vm_read_overwrite(task, addr, size, data, out_size);
+}
+
+static kern_return_t vmsw_vm_write(vm_map_t task, vm_address_t addr,
+                                   vm_offset_t data,
+                                   mach_msg_type_number_t cnt) {
+    if (task == VMSW_SENTINEL_PORT)
+        return vmsw_mach_vm_write(task, addr, data, cnt);
+    return vm_write(task, addr, data, cnt);
+}
+
+static kern_return_t vmsw_vm_protect(vm_map_t task, vm_address_t addr,
+                                     vm_size_t size, boolean_t set_max,
+                                     vm_prot_t new_prot) {
+    if (task == VMSW_SENTINEL_PORT)
+        return vmsw_mach_vm_protect(task, addr, size, set_max, new_prot);
+    return vm_protect(task, addr, size, set_max, new_prot);
+}
+
+static kern_return_t vmsw_vm_allocate(vm_map_t task, vm_address_t *addr,
+                                      vm_size_t size, int flags) {
+    if (task == VMSW_SENTINEL_PORT) {
+        mach_vm_address_t a = 0;
+        kern_return_t kr = vmsw_mach_vm_allocate(task, &a, size, flags);
+        if (kr == KERN_SUCCESS && addr) *addr = (vm_address_t)a;
+        return kr;
+    }
+    return vm_allocate(task, addr, size, flags);
+}
+
+static kern_return_t vmsw_vm_deallocate(vm_map_t task, vm_address_t addr,
+                                        vm_size_t size) {
+    if (task == VMSW_SENTINEL_PORT)
+        return vmsw_mach_vm_deallocate(task, addr, size);
+    return vm_deallocate(task, addr, size);
+}
+
+/* vm_region / vm_region_recurse aren't exported on macOS 12+; modern tools
+ * call the mach_vm_* variants which we already interpose. */
+
 /* -- DYLD_INTERPOSE table ------------------------------------------------- */
 
 #define DYLD_INTERPOSE(_replacement, _replacee) \
@@ -499,3 +653,19 @@ DYLD_INTERPOSE(vmsw_thread_set_state,        thread_set_state);
 DYLD_INTERPOSE(vmsw_mach_vm_allocate,        mach_vm_allocate);
 DYLD_INTERPOSE(vmsw_mach_vm_deallocate,      mach_vm_deallocate);
 DYLD_INTERPOSE(vmsw_mach_vm_protect,         mach_vm_protect);
+DYLD_INTERPOSE(vmsw_pid_for_task,            pid_for_task);
+DYLD_INTERPOSE(vmsw_task_set_info,           task_set_info);
+DYLD_INTERPOSE(vmsw_task_terminate,          task_terminate);
+DYLD_INTERPOSE(vmsw_task_set_exception_ports, task_set_exception_ports);
+DYLD_INTERPOSE(vmsw_task_get_exception_ports, task_get_exception_ports);
+DYLD_INTERPOSE(vmsw_thread_info,             thread_info);
+DYLD_INTERPOSE(vmsw_thread_suspend,          thread_suspend);
+DYLD_INTERPOSE(vmsw_thread_resume,           thread_resume);
+DYLD_INTERPOSE(vmsw_thread_terminate,        thread_terminate);
+DYLD_INTERPOSE(vmsw_mach_port_destroy,       mach_port_destroy);
+DYLD_INTERPOSE(vmsw_vm_read,                 vm_read);
+DYLD_INTERPOSE(vmsw_vm_read_overwrite,       vm_read_overwrite);
+DYLD_INTERPOSE(vmsw_vm_write,                vm_write);
+DYLD_INTERPOSE(vmsw_vm_protect,              vm_protect);
+DYLD_INTERPOSE(vmsw_vm_allocate,             vm_allocate);
+DYLD_INTERPOSE(vmsw_vm_deallocate,           vm_deallocate);

@@ -118,6 +118,9 @@ echo "$OUT" | grep -q "task_basic_info: vsz="     || { echo "    no TASK_BASIC_I
 echo "$OUT" | grep -q "^task_threads: "           || { echo "    no task_threads";     fail=1; }
 echo "$OUT" | grep -q " pc=0x"                    || { echo "    no thread_get_state"; fail=1; }
 echo "$OUT" | grep -q 'alloc/rt:.*round-trip'     || { echo "    no alloc round-trip"; fail=1; }
+echo "$OUT" | grep -q "^pid_for_task: "           || { echo "    no pid_for_task";    fail=1; }
+echo "$OUT" | grep -q "^vm_read_overwrite: "      || { echo "    no legacy vm_read";  fail=1; }
+echo "$OUT" | grep -q "^thread_info: ok"          || { echo "    no thread_info";     fail=1; }
 if [[ $fail -eq 0 ]]; then
     echo -e "${CHECK} mach API shim ok"
 else

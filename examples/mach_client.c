@@ -156,6 +156,40 @@ int main(int argc, char **argv) {
         printf("task_threads failed: %s\n", mach_error_string(kr));
     }
 
+    /* --- pid_for_task (verifies the sentinel maps back to our pid) --- */
+    int got_pid = 0;
+    if (pid_for_task(task, &got_pid) == KERN_SUCCESS)
+        printf("pid_for_task: %d\n", got_pid);
+
+    /* --- legacy vm_read (same kernel route, older symbol some tools call) --- */
+    {
+        uint8_t legacy_buf[4];
+        vm_size_t lgot = 0;
+        kern_return_t lkr = vm_read_overwrite(task, addr, 4,
+                                              (vm_address_t)(uintptr_t)legacy_buf,
+                                              &lgot);
+        if (lkr == KERN_SUCCESS)
+            printf("vm_read_overwrite: %llu bytes (first=%02x)\n",
+                   (unsigned long long)lgot, legacy_buf[0]);
+    }
+
+    /* --- thread_info on one of our threads --- */
+    thread_act_array_t threads2 = NULL;
+    mach_msg_type_number_t tc2 = 0;
+    if (task_threads(task, &threads2, &tc2) == KERN_SUCCESS && tc2 > 0) {
+        thread_basic_info_data_t tbi;
+        mach_msg_type_number_t tcnt = THREAD_BASIC_INFO_COUNT;
+        if (thread_info(threads2[0], THREAD_BASIC_INFO,
+                        (thread_info_t)&tbi, &tcnt) == KERN_SUCCESS)
+            printf("thread_info: ok (cpu_usage=%d run_state=%d)\n",
+                   tbi.cpu_usage, tbi.run_state);
+        for (mach_msg_type_number_t i = 0; i < tc2; i++)
+            mach_port_deallocate(mach_task_self(), threads2[i]);
+        mach_vm_deallocate(mach_task_self(),
+                           (mach_vm_address_t)(uintptr_t)threads2,
+                           tc2 * sizeof(thread_act_t));
+    }
+
     /* --- allocate / write / read / deallocate cycle in target --- */
     mach_vm_address_t mine = 0;
     kr = mach_vm_allocate(task, &mine, 64, VM_FLAGS_ANYWHERE);
