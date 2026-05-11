@@ -19,20 +19,25 @@ LDFLAGS    += $(ARCHFLAGS) -mmacosx-version-min=11.0
 CONTROLLER_SRC := src/controller.c src/patcher.c
 PAYLOAD_SRC    := payload/payload.c
 CLI_SRC        := cli/vm_stowaway.c
+SHIM_SRC       := shim/machshim.c
 
 CONTROLLER_OBJ := $(CONTROLLER_SRC:%.c=$(BUILD)/%.o)
 PAYLOAD_OBJ    := $(PAYLOAD_SRC:%.c=$(BUILD)/%.o)
 CLI_OBJ        := $(CLI_SRC:%.c=$(BUILD)/%.o)
+SHIM_OBJ       := $(SHIM_SRC:%.c=$(BUILD)/%.o)
 
 LIB_STATIC  := $(BUILD)/lib$(NAME).a
 LIB_DYNAMIC := $(BUILD)/lib$(NAME).dylib
 PAYLOAD_LIB := $(BUILD)/lib$(NAME)_payload.dylib
+SHIM_LIB    := $(BUILD)/lib$(NAME)_machshim.dylib
 CLI_BIN     := $(BUILD)/$(NAME)
 
-EXAMPLES := $(BUILD)/examples/target $(BUILD)/examples/controller_example
+EXAMPLES := $(BUILD)/examples/target \
+            $(BUILD)/examples/controller_example \
+            $(BUILD)/examples/mach_client
 
 .PHONY: all clean install test
-all: $(LIB_STATIC) $(LIB_DYNAMIC) $(PAYLOAD_LIB) $(CLI_BIN) $(EXAMPLES)
+all: $(LIB_STATIC) $(LIB_DYNAMIC) $(PAYLOAD_LIB) $(SHIM_LIB) $(CLI_BIN) $(EXAMPLES)
 
 # Compile .c -> .o under build/
 $(BUILD)/%.o: %.c
@@ -61,6 +66,14 @@ $(PAYLOAD_LIB): $(PAYLOAD_OBJ)
 	    $(LDFLAGS) -lpthread $^ -o $@
 	codesign --force --sign - $@
 
+# Mach API shim: DYLD_INSERT this into a memory-inspection tool so its
+# task_for_pid + mach_vm_* calls route through a vm_stowaway payload.
+$(SHIM_LIB): $(SHIM_OBJ) $(LIB_STATIC)
+	@mkdir -p $(dir $@)
+	$(CC) -dynamiclib -install_name @rpath/lib$(NAME)_machshim.dylib \
+	    $(LDFLAGS) $(SHIM_OBJ) $(LIB_STATIC) -lpthread -o $@
+	codesign --force --sign - $@
+
 # CLI links the static library so the binary is self-contained
 $(CLI_BIN): $(CLI_OBJ) $(LIB_STATIC)
 	@mkdir -p $(dir $@)
@@ -79,6 +92,13 @@ $(BUILD)/examples/target: examples/target.c
 $(BUILD)/examples/controller_example: examples/controller_example.c $(LIB_STATIC)
 	@mkdir -p $(dir $@)
 	$(CC) $(EXAMPLE_CFLAGS) $(LDFLAGS) $< $(LIB_STATIC) -o $@
+	codesign --force --sign - $@
+
+# Stripped-down mach client: task_for_pid + mach_vm_read_overwrite + write.
+# Useful for testing the shim independently of any third-party tool.
+$(BUILD)/examples/mach_client: examples/mach_client.c
+	@mkdir -p $(dir $@)
+	$(CC) $(EXAMPLE_CFLAGS) $(LDFLAGS) $< -o $@
 	codesign --force --sign - $@
 
 install: all

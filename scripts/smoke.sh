@@ -49,8 +49,10 @@ fi
 section "Verify build outputs"
 run_step "controller library" test -f "$BUILD/libvm_stowaway.a"
 run_step "payload dylib"      test -f "$BUILD/libvm_stowaway_payload.dylib"
+run_step "mach shim dylib"    test -f "$BUILD/libvm_stowaway_machshim.dylib"
 run_step "vm_stowaway CLI"    test -x "$BUILD/vm_stowaway"
 run_step "target binary"      test -x "$TARGET"
+run_step "mach_client binary" test -x "$BUILD/examples/mach_client"
 
 section "DYLD_INSERT_LIBRARIES backend"
 OUTPUT=$("$EXAMPLE" "$TARGET" 5 2>&1 || true)
@@ -84,6 +86,34 @@ if grep -q "secret=1337" "$PATCHED.out"; then
 else
     echo -e "${CROSS} patcher path: target never observed new value"
     sed 's/^/    /' < "$PATCHED.out"
+    exit 1
+fi
+
+section "mach API shim (DYLD_INTERPOSE over mach_vm_*)"
+PATCHED2=$(mktemp -t vmsw-shimtest.XXXXXX)
+cp "$TARGET" "$PATCHED2"
+chmod +x "$PATCHED2"
+"$BUILD/vm_stowaway" patch "$PATCHED2" "$PWD/$BUILD/libvm_stowaway_payload.dylib" \
+    >/dev/null 2>&1
+"$PATCHED2" 20 > "$PATCHED2.out" 2>&1 &
+T2=$!
+disown 2>/dev/null || true
+trap '{ kill $T2 2>/dev/null; wait $T2 2>/dev/null; rm -f "$PATCHED2" "$PATCHED2.out"; } >/dev/null 2>&1' EXIT
+sleep 1
+
+SECRET=$("$BUILD/vm_stowaway" resolve $T2 secret 2>/dev/null)
+echo "    secret @ $SECRET"
+echo "    running mach_client through shim ..."
+OUT=$("$BUILD/vm_stowaway" wrap --pid $T2 -- \
+    "$BUILD/examples/mach_client" $T2 $SECRET 4 "39050000" 2>&1)
+echo "$OUT" | sed 's/^/    /'
+sleep 2
+if grep -q "secret=1337" "$PATCHED2.out" && \
+   echo "$OUT" | grep -q "wrote 4 bytes" && \
+   echo "$OUT" | grep -q "region:"; then
+    echo -e "${CHECK} mach API shim ok"
+else
+    echo -e "${CROSS} mach API shim path failed"
     exit 1
 fi
 

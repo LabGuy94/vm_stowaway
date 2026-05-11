@@ -18,8 +18,10 @@
 #include "../include/vm_stowaway.h"
 
 #include <ctype.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <inttypes.h>
+#include <libgen.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -315,6 +317,66 @@ static int cmd_launch(int argc, char **argv) {
     return 0;
 }
 
+/* Try to find libvm_stowaway_machshim.dylib next to the CLI binary, then
+ * one directory up, then in /usr/local/lib. */
+static int default_shim_path(char *out, size_t outlen) {
+    Dl_info info;
+    if (dladdr((void *)default_shim_path, &info) && info.dli_fname) {
+        char buf[1024];
+        snprintf(buf, sizeof(buf), "%s", info.dli_fname);
+        char *dir = dirname(buf);
+        if (dir) {
+            snprintf(out, outlen, "%s/libvm_stowaway_machshim.dylib", dir);
+            if (access(out, R_OK) == 0) return 0;
+            snprintf(out, outlen, "%s/../libvm_stowaway_machshim.dylib", dir);
+            if (access(out, R_OK) == 0) return 0;
+        }
+    }
+    snprintf(out, outlen, "/usr/local/lib/libvm_stowaway_machshim.dylib");
+    return access(out, R_OK) == 0 ? 0 : -1;
+}
+
+static int cmd_wrap(int argc, char **argv) {
+    pid_t target_pid = 0;
+    const char *sock = NULL;
+    char shim[1024] = {0};
+    int i = 0;
+    for (; i < argc; i++) {
+        if (!strcmp(argv[i], "--pid") && i + 1 < argc) target_pid = (pid_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--sock") && i + 1 < argc) sock = argv[++i];
+        else if (!strcmp(argv[i], "--shim") && i + 1 < argc) snprintf(shim, sizeof(shim), "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--")) { i++; break; }
+        else break;
+    }
+    if (target_pid <= 0 || i >= argc)
+        die("usage: vm_stowaway wrap --pid PID [--sock PATH] [--shim PATH] -- <tool> [args...]");
+
+    if (!shim[0] && default_shim_path(shim, sizeof(shim)) < 0)
+        die("can't find libvm_stowaway_machshim.dylib; pass --shim PATH");
+
+    char pid_str[32];
+    snprintf(pid_str, sizeof(pid_str), "%d", target_pid);
+    setenv("VM_STOWAWAY_TARGET_PID", pid_str, 1);
+    if (sock) setenv("VM_STOWAWAY_SOCK", sock, 1);
+
+    /* Append our shim to DYLD_INSERT_LIBRARIES rather than clobbering, in
+     * case the user is already injecting something. */
+    const char *existing = getenv("DYLD_INSERT_LIBRARIES");
+    if (existing && *existing) {
+        size_t n = strlen(existing) + 1 + strlen(shim) + 1;
+        char *combined = malloc(n);
+        snprintf(combined, n, "%s:%s", existing, shim);
+        setenv("DYLD_INSERT_LIBRARIES", combined, 1);
+        free(combined);
+    } else {
+        setenv("DYLD_INSERT_LIBRARIES", shim, 1);
+    }
+
+    info("wrap pid=%d shim=%s -> exec %s", target_pid, shim, argv[i]);
+    execvp(argv[i], &argv[i]);
+    die("exec %s: %s", argv[i], strerror(errno));
+}
+
 static int cmd_attach(int argc, char **argv) {
     if (argc < 1) die("usage: vm_stowaway attach <pid> [--sock PATH]");
     pid_t pid = (pid_t)atoi(argv[0]);
@@ -351,6 +413,8 @@ static void usage(void) {
     printf("  launch  <target> [args...]         spawn target with payload via DYLD_INSERT_LIBRARIES\n");
     printf("  patch   <bin> <install-name>       add LC_LOAD_DYLIB to bin so payload loads on its own\n");
     printf("            [--weak] [--out PATH] [--no-sign]\n");
+    printf("  wrap    --pid PID [--sock PATH] [--shim PATH] -- <tool> [args...]\n");
+    printf("                                     launch <tool> with the mach shim DYLD_INSERTed\n");
     printf("  attach  <pid> [--sock PATH]        connect to a running process that already has payload\n");
     printf("  read    <pid> <addr> <len>\n");
     printf("  write   <pid> <addr> <hex>\n");
@@ -369,6 +433,7 @@ int main(int argc, char **argv) {
 
     if (!strcmp(cmd, "launch"))   return cmd_launch(sub_argc, sub_argv);
     if (!strcmp(cmd, "patch"))    return cmd_patch(sub_argc, sub_argv);
+    if (!strcmp(cmd, "wrap"))     return cmd_wrap(sub_argc, sub_argv);
     if (!strcmp(cmd, "attach"))   return cmd_attach(sub_argc, sub_argv);
     if (!strcmp(cmd, "read"))     return cmd_read(sub_argc, sub_argv);
     if (!strcmp(cmd, "write"))    return cmd_write(sub_argc, sub_argv);

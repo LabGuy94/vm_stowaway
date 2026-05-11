@@ -216,7 +216,7 @@ static int op_regions(int fd, uint32_t seq) {
             mach_task_self(), &addr, &size, &depth,
             (vm_region_recurse_info_t)&info, &count);
         if (kr != KERN_SUCCESS) break;
-        if (info.is_submap) { depth++; continue; }
+        if (info.is_submap) { addr += size; continue; }
 
         if (used + sizeof(struct vmsw_region_entry) > cap) {
             cap *= 2;
@@ -317,7 +317,7 @@ static int op_scan(int fd, uint32_t seq, const uint8_t *body, uint64_t body_len)
             (vm_region_recurse_info_t)&info, &count);
         if (kr != KERN_SUCCESS) break;
         if (addr >= req.end) break;
-        if (info.is_submap) { depth++; continue; }
+        if (info.is_submap) { addr += size; continue; }
         if (!(info.protection & VM_PROT_READ)) { addr += size; continue; }
 
         mach_vm_address_t scan_start = addr;
