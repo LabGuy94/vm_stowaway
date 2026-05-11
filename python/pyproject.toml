@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vm_stowaway"
+version = "0.1.0"
+description = "ctypes bindings for the vm_stowaway controller library (macOS process memory access)"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "LabGuy94" }]
+keywords = ["macos", "memory", "injection", "mach", "reverse-engineering"]
+classifiers = [
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Debuggers",
+]
+
+[project.urls]
+Homepage = "https://github.com/LabGuy94/vm_stowaway"
+
+[tool.hatch.build.targets.wheel]
+packages = ["vm_stowaway"]

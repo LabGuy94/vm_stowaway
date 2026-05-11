@@ -90,6 +90,32 @@ the full surface is in [`include/vm_stowaway.h`](include/vm_stowaway.h):
 
 examples in [`examples/controller_example.c`](examples/controller_example.c) (launch + read/write) and [`examples/attach_example.c`](examples/attach_example.c) (attach + call).
 
+## python
+
+ctypes wrapper in [`python/`](python/). install the native library first, then:
+
+```sh
+pip install ./python
+```
+
+```python
+import vm_stowaway as vms
+
+with vms.launch("./mytarget") as h:
+    addr = h.resolve("g_secret")
+    h.write_u32(addr, 0x1337)
+    print(h.read_u32(addr))
+
+with vms.attach(vms.find_pid("Some.app")) as h:
+    print(h.call(h.resolve("getpid", image="libsystem_c")))
+
+vms.patch("/path/to/binary", "@rpath/libvm_stowaway_payload.dylib")
+for app in vms.scan_apps(permissive_only=True):
+    print(app.path)
+```
+
+`VM_STOWAWAY_LIB=...` to override the dylib search path. full API in [`python/vm_stowaway/__init__.py`](python/vm_stowaway/__init__.py) — every public C function is exposed.
+
 ## shim
 
 if you already have a memory-inspection tool that calls `task_for_pid` + the `mach_vm_*` family, `libvm_stowaway_machshim.dylib` is a drop-in: route those calls through the payload sitting inside the target, no SIP off / debug entitlements / `taskport.allow` needed.

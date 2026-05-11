@@ -10,9 +10,14 @@ COMMON_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic \
                  -Wno-gnu-zero-variadic-macro-arguments \
                  -Iinclude -Isrc $(ARCHFLAGS) -mmacosx-version-min=11.0
 CFLAGS     ?= -O2 -g
-CFLAGS     += $(COMMON_CFLAGS) -fvisibility=hidden -fPIC
+CFLAGS     += $(COMMON_CFLAGS) -fPIC
 EXAMPLE_CFLAGS := -O2 -g $(COMMON_CFLAGS)
 LDFLAGS    += $(ARCHFLAGS) -mmacosx-version-min=11.0
+
+# payload and shim host internal externs (DYLD_INTERPOSE entries aside) that
+# should not leak; the controller library's externs ARE the public surface.
+$(BUILD)/payload/%.o: CFLAGS += -fvisibility=hidden
+$(BUILD)/shim/%.o:    CFLAGS += -fvisibility=hidden
 
 CONTROLLER_SRC := src/controller.c src/patcher.c src/scanner.c
 PAYLOAD_SRC    := payload/payload.c
@@ -52,6 +57,7 @@ $(LIB_DYNAMIC): $(CONTROLLER_OBJ)
 	@mkdir -p $(dir $@)
 	$(CC) -dynamiclib -install_name @rpath/lib$(NAME).dylib \
 	    -current_version $(VERSION) -compatibility_version 1.0.0 \
+	    -Wl,-exported_symbol,_vm_stowaway_* \
 	    $(LDFLAGS) $^ -o $@
 	codesign --force --sign - $@
 
